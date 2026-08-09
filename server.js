@@ -11,6 +11,7 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { Pinecone } = require('@pinecone-database/pinecone');
+const fs = require('fs');
 
 // Polyfill fetch for Node.js < 18
 if (typeof fetch === 'undefined') {
@@ -30,21 +31,33 @@ app.use(express.static('public'));
 // ============================================
 // FIREBASE INITIALIZATION
 // ============================================
-const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './serviceAccountKey.json';
-const fs = require('fs');
+let serviceAccount;
 
-if (fs.existsSync(serviceAccountPath)) {
-  console.log(`Using Firebase credentials from file: ${serviceAccountPath}`);
-  const serviceAccount = require(serviceAccountPath);
-  
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  console.log('✓ Firebase Admin initialized successfully');
+if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  try {
+    // Parse JSON directly from Render Environment Variable
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    console.log('✓ Using Firebase credentials from environment variable (Render)');
+  } catch (error) {
+    console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON environment variable:', error.message);
+    process.exit(1);
+  }
 } else {
-  console.error('❌ Firebase service account file not found:', serviceAccountPath);
-  process.exit(1);
+  // Fallback to local file for development
+  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './serviceAccountKey.json';
+  if (fs.existsSync(serviceAccountPath)) {
+    console.log(`Using Firebase credentials from file: ${serviceAccountPath}`);
+    serviceAccount = require(serviceAccountPath);
+  } else {
+    console.error('❌ Firebase service account not found in environment variables or file path:', serviceAccountPath);
+    process.exit(1);
+  }
 }
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+console.log('✓ Firebase Admin initialized successfully');
 
 const db = admin.firestore();
 
@@ -531,14 +544,14 @@ app.listen(PORT, () => {
   console.log(`✓ Firebase: Connected`);
   console.log(`✓ Pinecone: Connected (${indexName})`);
   console.log(`\n📡 AI Providers (Priority Order):`);
-  console.log(`   1. ${AI_PROVIDERS.mistral.name} ${AI_PROVIDERS.mistral.apiKey ? '✓' : '✗'}`);
-  console.log(`   2. ${AI_PROVIDERS.groq.name} ${AI_PROVIDERS.groq.apiKey ? '✓' : '✗'}`);
-  console.log(`   3. ${AI_PROVIDERS.gemini.name} ${AI_PROVIDERS.gemini.apiKey ? '✓' : '✗'}`);
-  console.log(`   4. ${AI_PROVIDERS.openrouter.name} ${AI_PROVIDERS.openrouter.apiKey ? '✓' : '✗'}`);
+  console.log(`    1. ${AI_PROVIDERS.mistral.name} ${AI_PROVIDERS.mistral.apiKey ? '✓' : '✗'}`);
+  console.log(`    2. ${AI_PROVIDERS.groq.name} ${AI_PROVIDERS.groq.apiKey ? '✓' : '✗'}`);
+  console.log(`    3. ${AI_PROVIDERS.gemini.name} ${AI_PROVIDERS.gemini.apiKey ? '✓' : '✗'}`);
+  console.log(`    4. ${AI_PROVIDERS.openrouter.name} ${AI_PROVIDERS.openrouter.apiKey ? '✓' : '✗'}`);
   console.log(`\n🌐 Endpoints:`);
-  console.log(`   POST /api/pinecone/search - RAG semantic search`);
-  console.log(`   POST /api/chat - AI chat with fallback`);
-  console.log(`   GET  /api/health - Health check`);
+  console.log(`    POST /api/pinecone/search - RAG semantic search`);
+  console.log(`    POST /api/chat - AI chat with fallback`);
+  console.log(`    GET  /api/health - Health check`);
   console.log(`${'='.repeat(50)}\n`);
 });
 
