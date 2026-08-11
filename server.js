@@ -252,6 +252,277 @@ async function callAIWithFallback(messages, maxTokens = 1000) {
 }
 
 // ============================================
+// PINECONE SYNC HELPERS
+// ============================================
+
+/**
+ * Generate embedding for text using Pinecone Inference API
+ */
+async function generateEmbedding(text) {
+  try {
+    const embedResponse = await fetch('https://api.pinecone.io/embed', {
+      method: 'POST',
+      headers: {
+        'Api-Key': process.env.PINECONE_API_KEY,
+        'Content-Type': 'application/json',
+        'X-Pinecone-Api-Version': '2024-10'
+      },
+      body: JSON.stringify({
+        model: 'multilingual-e5-large',
+        parameters: {
+          input_type: 'passage',
+          truncate: 'END'
+        },
+        inputs: [{ text }]
+      })
+    });
+    
+    if (!embedResponse.ok) {
+      const errorText = await embedResponse.text();
+      throw new Error(`Embedding generation failed: ${errorText}`);
+    }
+    
+    const embedData = await embedResponse.json();
+    return embedData.data[0].values;
+  } catch (error) {
+    console.error('❌ Embedding generation error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Upsert a project to Pinecone
+ */
+async function upsertProjectToPinecone(projectId, projectData) {
+  try {
+    console.log(`📤 Upserting project to Pinecone: ${projectId}`);
+    
+    // Build searchable text combining key fields
+    const searchableText = [
+      projectData.title || '',
+      Array.isArray(projectData.authors) ? projectData.authors.join(' ') : (projectData.authors || ''),
+      projectData.abstract || '',
+      projectData.keyFindings || '',
+      projectData.program || '',
+      projectData.adviser || '',
+      Array.isArray(projectData.topics) ? projectData.topics.join(' ') : '',
+      Array.isArray(projectData.keywords) ? projectData.keywords.join(' ') : ''
+    ].filter(Boolean).join(' ').trim();
+    
+    if (!searchableText) {
+      console.warn('⚠️  No searchable content for project:', projectId);
+      return;
+    }
+    
+    // Generate embedding
+    const embedding = await generateEmbedding(searchableText);
+    
+    // Prepare metadata (Pinecone has limitations on metadata)
+    const metadata = {
+      title: projectData.title || 'Untitled',
+      authors: Array.isArray(projectData.authors) 
+        ? projectData.authors.join(', ') 
+        : (projectData.authors || ''),
+      program: projectData.program || '',
+      year: projectData.year ? parseInt(projectData.year) : 0,
+      adviser: projectData.adviser || '',
+      abstract: projectData.abstract ? projectData.abstract.substring(0, 500) : '',
+      status: projectData.status || 'Completed'
+    };
+    
+    // Upsert to Pinecone
+    const upsertUrl = `https://${process.env.PINECONE_INDEX_HOST}/vectors/upsert`;
+    const response = await fetch(upsertUrl, {
+      method: 'POST',
+      headers: {
+        'Api-Key': process.env.PINECONE_API_KEY,
+        'Content-Type': 'application/json',
+        'X-Pinecone-Api-Version': '2025-04'
+      },
+      body: JSON.stringify({
+        namespace: '__default__',
+        vectors: [{
+          id: projectId,
+          values: embedding,
+          metadata
+        }]
+      })
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Pinecone upsert failed: ${errorText}`);
+    }
+    
+    console.log(`✓ Project upserted to Pinecone: ${projectId}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to upsert project to Pinecone:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Delete a project from Pinecone
+ */
+async function deleteProjectFromPinecone(projectId) {
+  try {
+    console.log(`🗑️  Deleting project from Pinecone: ${projectId}`);
+    
+    const deleteUrl = `https://${process.env.PINECONE_INDEX_HOST}/vectors/delete`;
+    const response = await fetch(deleteUrl, {
+      method: 'POST',
+      headers: {
+        'Api-Key': process.env.PINECONE_API_KEY,
+        'Content-Type': 'application/json',
+        'X-Pinecone-Api-Version': '2025-04'
+      },
+      body: JSON.stringify({
+        namespace: '__default__',
+        ids: [projectId]
+      })
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Pinecone delete failed: ${errorText}`);
+    }
+    
+    console.log(`✓ Project deleted from Pinecone: ${projectId}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to delete project from Pinecone:`, error);
+    throw error;
+  }
+}
+
+// ============================================
+// PROJECT SYNC ENDPOINTS
+// ============================================
+
+/**
+ * POST /api/projects/sync
+ * Sync a project to Pinecone (create or update)
+ */
+app.post('/api/projects/sync', async (req, res) => {
+  try {
+    const { projectId, projectData } = req.body;
+    
+    if (!projectId || !projectData) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'projectId and projectData are required' 
+      });
+    }
+    
+    await upsertProjectToPinecone(projectId, projectData);
+    
+    res.json({
+      success: true,
+      message: 'Project synced to Pinecone successfully',
+      projectId
+    });
+  } catch (error) {
+    console.error('❌ Sync error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * DELETE /api/projects/sync/:projectId
+ * Delete a project from Pinecone
+ */
+app.delete('/api/projects/sync/:projectId', async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    
+    if (!projectId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'projectId is required' 
+      });
+    }
+    
+    await deleteProjectFromPinecone(projectId);
+    
+    res.json({
+      success: true,
+      message: 'Project deleted from Pinecone successfully',
+      projectId
+    });
+  } catch (error) {
+    console.error('❌ Delete error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/projects/sync-all
+ * Sync all projects from Firestore to Pinecone
+ */
+app.post('/api/projects/sync-all', async (req, res) => {
+  try {
+    console.log('🔄 Starting full Pinecone sync...');
+    
+    // Fetch all projects from Firestore
+    const projectsSnapshot = await db.collection('projects').get();
+    const projects = [];
+    
+    projectsSnapshot.forEach(doc => {
+      projects.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+    
+    console.log(`📦 Found ${projects.length} projects to sync`);
+    
+    // Sync each project to Pinecone
+    const results = {
+      success: 0,
+      failed: 0,
+      errors: []
+    };
+    
+    for (const project of projects) {
+      try {
+        await upsertProjectToPinecone(project.id, project);
+        results.success++;
+      } catch (error) {
+        results.failed++;
+        results.errors.push({
+          projectId: project.id,
+          error: error.message
+        });
+      }
+    }
+    
+    console.log(`✓ Sync complete: ${results.success} success, ${results.failed} failed`);
+    
+    res.json({
+      success: true,
+      message: 'Full sync completed',
+      totalProjects: projects.length,
+      synced: results.success,
+      failed: results.failed,
+      errors: results.errors
+    });
+  } catch (error) {
+    console.error('❌ Full sync error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============================================
 // RAG ENDPOINTS
 // ============================================
 
