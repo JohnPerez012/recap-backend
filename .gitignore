@@ -6,6 +6,7 @@ package-lock.json
 
 # Firebase service account key (NEVER commit this!)
 serviceAccountKey.json
+seed-admin.js
 
 # Logs
 *.log
