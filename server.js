@@ -13,10 +13,25 @@ const admin = require('firebase-admin');
 const { Pinecone } = require('@pinecone-database/pinecone');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
+let cloudinary = null;
+try {
+  cloudinary = require('cloudinary').v2;
+} catch (err) {
+  console.warn('⚠️ Cloudinary module not found. Image deletion endpoint will be disabled until installed.');
+}
 
 // Polyfill fetch for Node.js < 18
 if (typeof fetch === 'undefined') {
   global.fetch = require('node-fetch');
+}
+
+// Configure undici with 30s connection timeout to eliminate ConnectTimeoutError to Pinecone
+try {
+  const { Agent, setGlobalDispatcher } = require('undici');
+  setGlobalDispatcher(new Agent({ connect: { timeout: 30000 } }));
+  console.log('✓ Undici global dispatcher configured with 30s connect timeout');
+} catch (err) {
+  console.warn('⚠️ Could not configure undici dispatcher:', err.message);
 }
 
 const app = express();
@@ -111,6 +126,26 @@ try {
   }
 } catch (error) {
   console.error('❌ Failed to initialize email transporter:', error.message);
+}
+
+// ============================================
+// CLOUDINARY CONFIGURATION
+// ============================================
+try {
+  if (cloudinary && process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+    cloudinary.config({
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+      api_key: process.env.CLOUDINARY_API_KEY,
+      api_secret: process.env.CLOUDINARY_API_SECRET
+    });
+    console.log('✓ Cloudinary configured');
+  } else if (!cloudinary) {
+    console.warn('⚠️  Cloudinary package not available. Image deletion disabled.');
+  } else {
+    console.warn('⚠️  Cloudinary credentials not configured. Image deletion will not work.');
+  }
+} catch (error) {
+  console.error('❌ Failed to configure Cloudinary:', error.message);
 }
 
 // ============================================
@@ -541,23 +576,82 @@ async function generateEmbedding(text) {
 }
 
 /**
+ * Format project text with explicit semantic labels for Pinecone embeddings
+ * Produces structured format:
+ * "Title: ... Abstract: ... Adviser: ... Authors: ... Program: ... Year: ... Keywords: ... Key Findings: ... Topics: ..."
+ */
+function formatSearchableText(projectData) {
+  const parts = [];
+
+  // Title
+  if (projectData.title && typeof projectData.title === 'string' && projectData.title.trim()) {
+    parts.push(`Title: ${projectData.title.trim()}`);
+  }
+
+  // Abstract
+  if (projectData.abstract && typeof projectData.abstract === 'string' && projectData.abstract.trim()) {
+    parts.push(`Abstract: ${projectData.abstract.trim()}`);
+  }
+
+  // Adviser
+  if (projectData.adviser && typeof projectData.adviser === 'string' && projectData.adviser.trim()) {
+    parts.push(`Adviser: ${projectData.adviser.trim()}`);
+  }
+
+  // Authors
+  const authorsStr = Array.isArray(projectData.authors)
+    ? projectData.authors.map(a => (typeof a === 'string' ? a.trim() : a)).filter(Boolean).join(', ')
+    : (typeof projectData.authors === 'string' ? projectData.authors.trim() : '');
+  if (authorsStr) {
+    parts.push(`Authors: ${authorsStr}`);
+  }
+
+  // Program
+  if (projectData.program && typeof projectData.program === 'string' && projectData.program.trim()) {
+    parts.push(`Program: ${projectData.program.trim()}`);
+  }
+
+  // Year
+  if (projectData.year) {
+    parts.push(`Year: ${projectData.year}`);
+  }
+
+  // Keywords
+  const keywordsStr = Array.isArray(projectData.keywords)
+    ? projectData.keywords.map(k => (typeof k === 'string' ? k.trim() : k)).filter(Boolean).join(', ')
+    : (typeof projectData.keywords === 'string' ? projectData.keywords.trim() : '');
+  if (keywordsStr) {
+    parts.push(`Keywords: ${keywordsStr}`);
+  }
+
+  // Key Findings
+  if (projectData.keyFindings && typeof projectData.keyFindings === 'string' && projectData.keyFindings.trim()) {
+    parts.push(`Key Findings: ${projectData.keyFindings.trim()}`);
+  }
+
+  // Topics
+  const topicsStr = Array.isArray(projectData.topics)
+    ? projectData.topics.map(t => (typeof t === 'string' ? t.trim() : t)).filter(Boolean).join(', ')
+    : (typeof projectData.topics === 'string' ? projectData.topics.trim() : '');
+  if (topicsStr) {
+    parts.push(`Topics: ${topicsStr}`);
+  }
+
+  // Ensure each segment ends with a period for clear semantic boundaries
+  return parts
+    .map(part => (/[.!?]$/.test(part) ? part : `${part}.`))
+    .join(' ');
+}
+
+/**
  * Upsert a project to Pinecone
  */
 async function upsertProjectToPinecone(projectId, projectData) {
   try {
     console.log(`📤 Upserting project to Pinecone: ${projectId}`);
     
-    // Build searchable text combining key fields
-    const searchableText = [
-      projectData.title || '',
-      Array.isArray(projectData.authors) ? projectData.authors.join(' ') : (projectData.authors || ''),
-      projectData.abstract || '',
-      projectData.keyFindings || '',
-      projectData.program || '',
-      projectData.adviser || '',
-      Array.isArray(projectData.topics) ? projectData.topics.join(' ') : '',
-      Array.isArray(projectData.keywords) ? projectData.keywords.join(' ') : ''
-    ].filter(Boolean).join(' ').trim();
+    // Build searchable text with explicit labels for superior semantic search & context
+    const searchableText = formatSearchableText(projectData);
     
     if (!searchableText) {
       console.warn('⚠️  No searchable content for project:', projectId);
@@ -567,6 +661,13 @@ async function upsertProjectToPinecone(projectId, projectData) {
     // Generate embedding
     const embedding = await generateEmbedding(searchableText);
     
+    // Normalize keywords for metadata
+    const keywordsList = Array.isArray(projectData.keywords)
+      ? projectData.keywords.map(k => String(k).trim()).filter(Boolean)
+      : (typeof projectData.keywords === 'string' && projectData.keywords.trim()
+          ? projectData.keywords.split(',').map(k => k.trim()).filter(Boolean)
+          : []);
+
     // Prepare metadata
     const metadata = {
       title: projectData.title || 'Untitled',
@@ -577,36 +678,62 @@ async function upsertProjectToPinecone(projectId, projectData) {
       year: projectData.year ? parseInt(projectData.year) : 0,
       adviser: projectData.adviser || '',
       abstract: projectData.abstract || '',
+      keywords: keywordsList,
       text: searchableText,
       status: projectData.status || 'Completed'
     };
     
-    // Upsert to Pinecone
+    // Upsert to Pinecone with retry for network resilience
     const upsertUrl = `https://${process.env.PINECONE_INDEX_HOST}/vectors/upsert`;
-    const response = await fetch(upsertUrl, {
-      method: 'POST',
-      headers: {
-        'Api-Key': process.env.PINECONE_API_KEY,
-        'Content-Type': 'application/json',
-        'X-Pinecone-Api-Version': '2025-04'
-      },
-      body: JSON.stringify({
-        namespace: '__default__',
-        vectors: [{
-          id: projectId,
-          values: embedding,
-          metadata
-        }]
-      })
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Pinecone upsert failed: ${errorText}`);
+    let lastError = null;
+    const maxAttempts = 2;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      let timeoutId = null;
+      try {
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        if (controller) {
+          timeoutId = setTimeout(() => controller.abort(), 25000);
+        }
+
+        const response = await fetch(upsertUrl, {
+          method: 'POST',
+          headers: {
+            'Api-Key': process.env.PINECONE_API_KEY,
+            'Content-Type': 'application/json',
+            'X-Pinecone-Api-Version': '2025-04'
+          },
+          body: JSON.stringify({
+            namespace: '__default__',
+            vectors: [{
+              id: projectId,
+              values: embedding,
+              metadata
+            }]
+          }),
+          ...(controller ? { signal: controller.signal } : {})
+        });
+
+        if (timeoutId) clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Pinecone upsert failed: ${errorText}`);
+        }
+
+        console.log(`✓ Project upserted to Pinecone: ${projectId}`);
+        return true;
+      } catch (err) {
+        if (timeoutId) clearTimeout(timeoutId);
+        lastError = err;
+        console.warn(`⚠️ Pinecone upsert attempt ${attempt}/${maxAttempts} failed for ${projectId}:`, err.message);
+        if (attempt < maxAttempts) {
+          await new Promise(res => setTimeout(res, 1500));
+        }
+      }
     }
-    
-    console.log(`✓ Project upserted to Pinecone: ${projectId}`);
-    return true;
+
+    throw lastError;
   } catch (error) {
     console.error(`❌ Failed to upsert project to Pinecone:`, error);
     throw error;
@@ -656,25 +783,130 @@ async function deleteProjectFromPinecone(projectId) {
  * Sync a project to Pinecone (create or update)
  */
 app.post('/api/projects/sync', async (req, res) => {
-  try {
-    const { projectId, projectData } = req.body;
-    
-    if (!projectId || !projectData) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'projectId and projectData are required' 
+  const { projectId } = req.body;
+  let { projectData } = req.body;
+
+  if (!projectId) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'projectId is required' 
+    });
+  }
+
+  // If projectData is not provided in body, load it from Firestore
+  if (!projectData) {
+    try {
+      const projectDoc = await db.collection('projects').doc(projectId).get();
+      if (!projectDoc.exists) {
+        return res.status(404).json({
+          success: false,
+          error: `Project ${projectId} not found in database`
+        });
+      }
+      projectData = projectDoc.data();
+    } catch (dbErr) {
+      console.error(`❌ Error fetching project ${projectId} from Firestore:`, dbErr);
+      return res.status(500).json({
+        success: false,
+        error: `Database fetch failed: ${dbErr.message}`
       });
     }
-    
+  }
+
+  try {
     await upsertProjectToPinecone(projectId, projectData);
-    
+
+    // Mark as synced in Firestore
+    await db.collection('projects').doc(projectId).update({
+      pineconeSynced: true,
+      pineconeSyncedAt: admin.firestore.FieldValue.serverTimestamp()
+    }).catch(updateErr => {
+      console.warn(`Could not update Firestore pineconeSynced for ${projectId}:`, updateErr.message);
+    });
+
     res.json({
       success: true,
       message: 'Project synced to Pinecone successfully',
-      projectId
+      projectId,
+      pineconeSynced: true
     });
   } catch (error) {
     console.error('❌ Sync error:', error);
+
+    // Mark as unsynced in Firestore
+    await db.collection('projects').doc(projectId).update({
+      pineconeSynced: false,
+      pineconeSyncError: error.message || 'Sync failed'
+    }).catch(updateErr => {
+      console.warn(`Could not mark unsynced for ${projectId}:`, updateErr.message);
+    });
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      projectId,
+      pineconeSynced: false
+    });
+  }
+});
+
+/**
+ * GET /api/projects/sync-status
+ * Query Pinecone directly to get all indexed vector IDs and reconcile Firestore
+ */
+app.get('/api/projects/sync-status', async (req, res) => {
+  try {
+    const listUrl = `https://${process.env.PINECONE_INDEX_HOST}/vectors/list?namespace=__default__`;
+    let vectorIds = [];
+    let paginationToken = undefined;
+
+    do {
+      const url = paginationToken 
+        ? `${listUrl}&paginationToken=${encodeURIComponent(paginationToken)}`
+        : listUrl;
+
+      const response = await fetch(url, {
+        headers: {
+          'Api-Key': process.env.PINECONE_API_KEY,
+          'X-Pinecone-Api-Version': '2025-04'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Pinecone list failed: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      if (Array.isArray(data.vectors)) {
+        vectorIds.push(...data.vectors.map(v => v.id));
+      }
+      paginationToken = data.pagination?.next;
+    } while (paginationToken);
+
+    console.log(`🔍 Verified ${vectorIds.length} vectors in Pinecone:`, vectorIds);
+
+    // Reconcile matching Firestore documents
+    for (const id of vectorIds) {
+      try {
+        const docRef = db.collection('projects').doc(id);
+        const docSnap = await docRef.get();
+        if (docSnap.exists && docSnap.data().pineconeSynced !== true) {
+          await docRef.update({
+            pineconeSynced: true,
+            pineconeSyncedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+          console.log(`✓ Reconciled Firestore doc ${id} to pineconeSynced: true`);
+        }
+      } catch (err) {}
+    }
+
+    res.json({
+      success: true,
+      vectorIds,
+      total: vectorIds.length
+    });
+  } catch (error) {
+    console.error('❌ Sync-status error:', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -745,12 +977,22 @@ app.post('/api/projects/sync-all', async (req, res) => {
       try {
         await upsertProjectToPinecone(project.id, project);
         results.success++;
+        // Update Firestore doc with pineconeSynced: true
+        await db.collection('projects').doc(project.id).update({
+          pineconeSynced: true,
+          pineconeSyncedAt: admin.firestore.FieldValue.serverTimestamp()
+        }).catch(() => {});
       } catch (error) {
         results.failed++;
         results.errors.push({
           projectId: project.id,
           error: error.message
         });
+        // Update Firestore doc with pineconeSynced: false
+        await db.collection('projects').doc(project.id).update({
+          pineconeSynced: false,
+          pineconeSyncError: error.message
+        }).catch(() => {});
       }
     }
     
@@ -794,20 +1036,32 @@ app.post('/api/pinecone/search', async (req, res) => {
     
     // Build metadata filter if provided
     const metadataFilter = {};
-    if (filter.year) {
-      // Handle both single value and array of values
+    if (filter.year !== undefined && filter.year !== null && filter.year !== '') {
       if (Array.isArray(filter.year)) {
-        metadataFilter.year = { $in: filter.year };
+        metadataFilter.year = { $in: filter.year.map(y => parseInt(y)) };
       } else {
-        metadataFilter.year = { $eq: filter.year };
+        metadataFilter.year = { $eq: parseInt(filter.year) };
       }
     }
     if (filter.program) {
-      // Handle both single value and array of values
       if (Array.isArray(filter.program)) {
         metadataFilter.program = { $in: filter.program };
       } else {
         metadataFilter.program = { $eq: filter.program };
+      }
+    }
+    if (filter.adviser) {
+      if (Array.isArray(filter.adviser)) {
+        metadataFilter.adviser = { $in: filter.adviser };
+      } else {
+        metadataFilter.adviser = { $eq: filter.adviser };
+      }
+    }
+    if (filter.status) {
+      if (Array.isArray(filter.status)) {
+        metadataFilter.status = { $in: filter.status };
+      } else {
+        metadataFilter.status = { $eq: filter.status };
       }
     }
     
@@ -999,9 +1253,17 @@ ALLOWED: You may explain what this platform does and how it will work once proje
           if (project.adviser) systemPrompt += `\nAdviser: ${project.adviser}`;
           if (project.keywords) systemPrompt += `\nKeywords: ${Array.isArray(project.keywords) ? project.keywords.join(', ') : project.keywords}`;
           
-          const abstractContent = project.abstract || project.fullText || project.text || '';
+          let abstractContent = project.abstract || project.fullText || '';
+          if (!abstractContent && project.text) {
+            const abstractMatch = project.text.match(/Abstract:\s*([^]*?)(?=(?:\s*(?:Keywords|Adviser|Authors|Program|Year|Key Findings|Topics):|\n\n|\*$|$))/i);
+            if (abstractMatch && abstractMatch[1]) {
+              abstractContent = abstractMatch[1].trim();
+            }
+          }
           if (abstractContent) {
             systemPrompt += `\nAbstract: ${abstractContent}`;
+          } else if (project.text) {
+            systemPrompt += `\nProject Summary: ${project.text}`;
           }
           if (project.score !== undefined) {
             systemPrompt += `\nRelevance: ${(project.score * 100).toFixed(1)}%`;
@@ -1125,6 +1387,65 @@ app.post('/api/chat/mistral', (req, res) => handleSingleProviderChat('mistral', 
 app.post('/api/chat/groq', (req, res) => handleSingleProviderChat('groq', req, res));
 app.post('/api/chat/gemini', (req, res) => handleSingleProviderChat('gemini', req, res));
 app.post('/api/chat/openrouter', (req, res) => handleSingleProviderChat('openrouter', req, res));
+
+// ============================================
+// CLOUDINARY IMAGE DELETION
+// ============================================
+/**
+ * DELETE /api/cloudinary/delete
+ * Delete image from Cloudinary
+ */
+app.delete('/api/cloudinary/delete', async (req, res) => {
+  try {
+    const { publicId } = req.body;
+    
+    if (!publicId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Public ID is required'
+      });
+    }
+
+    if (!cloudinary) {
+      return res.status(503).json({
+        success: false,
+        message: 'Cloudinary module not configured on server'
+      });
+    }
+
+    console.log(`🗑️  Deleting image from Cloudinary: ${publicId}`);
+
+    const result = await cloudinary.uploader.destroy(publicId);
+
+    if (result.result === 'ok') {
+      console.log(`✓ Image deleted successfully: ${publicId}`);
+      return res.json({
+        success: true,
+        message: 'Image deleted successfully',
+        result: result.result
+      });
+    } else if (result.result === 'not found') {
+      console.warn(`⚠️  Image not found in Cloudinary: ${publicId}`);
+      return res.json({
+        success: true, // Not an error, just already deleted
+        message: 'Image not found (may have been deleted already)',
+        result: result.result
+      });
+    } else {
+      console.error(`❌ Cloudinary deletion failed: ${result.result}`);
+      return res.status(500).json({
+        success: false,
+        message: `Deletion failed: ${result.result}`
+      });
+    }
+  } catch (error) {
+    console.error('❌ Error deleting image from Cloudinary:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
 
 // ============================================
 // HEALTH CHECK
@@ -1518,9 +1839,9 @@ process.on('uncaughtException', (error) => {
  */
 app.post('/api/feedback', async (req, res) => {
   try {
-    const { name, email, subject, message } = req.body;
+    const { name, email, feeling, subject, message, images } = req.body;
     
-    console.log('📧 Feedback request received:', { name, email, subject: subject || 'No subject' });
+    console.log('📧 Feedback request received:', { name, email, feeling: feeling || 'Not specified', subject: subject || 'No subject' });
     
     // Validation
     if (!name || !email || !message) {
@@ -1553,6 +1874,21 @@ app.post('/api/feedback', async (req, res) => {
     const feedbackSubject = subject || 'New Feedback - RECAP Project Hub';
     const recipientEmail = process.env.FEEDBACK_RECIPIENT_EMAIL || process.env.SMTP_USER;
     
+    // Map feeling to emoji
+    const feelingEmojis = {
+      'excited': '🤩',
+      'happy': '😊',
+      'neutral': '😐',
+      'confused': '😕',
+      'sad': '😢',
+      'angry': '😠'
+    };
+    const feelingEmoji = feelingEmojis[feeling] || '💬';
+    const feelingText = feeling ? feeling.charAt(0).toUpperCase() + feeling.slice(1) : 'Not specified';
+    
+    // Primary color from system
+    const PRIMARY_COLOR = '#08D488';
+    
     // HTML email template for admin
     const htmlContent = `
       <!DOCTYPE html>
@@ -1560,67 +1896,157 @@ app.post('/api/feedback', async (req, res) => {
       <head>
         <style>
           body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             line-height: 1.6;
             color: #333;
             max-width: 600px;
             margin: 0 auto;
             padding: 20px;
+            background: #f5f5f5;
+          }
+          .email-container {
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
           }
           .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: ${PRIMARY_COLOR};
             color: white;
             padding: 30px;
-            border-radius: 10px 10px 0 0;
             text-align: center;
           }
+          .header h1 {
+            margin: 0 0 10px 0;
+            font-size: 28px;
+            font-weight: 700;
+          }
+          .header p {
+            margin: 0;
+            opacity: 0.95;
+            font-size: 14px;
+          }
           .content {
-            background: #f8f9fa;
             padding: 30px;
-            border-radius: 0 0 10px 10px;
           }
           .field {
             margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #e9ecef;
+          }
+          .field:last-child {
+            border-bottom: none;
           }
           .label {
             font-weight: 600;
-            color: #667eea;
-            margin-bottom: 5px;
+            color: ${PRIMARY_COLOR};
+            margin-bottom: 8px;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
           }
           .value {
-            background: white;
-            padding: 12px;
-            border-radius: 5px;
-            border-left: 3px solid #667eea;
+            background: #f8f9fa;
+            padding: 12px 15px;
+            border-radius: 8px;
+            border-left: 3px solid ${PRIMARY_COLOR};
+            font-size: 15px;
+          }
+          .value a {
+            color: ${PRIMARY_COLOR};
+            text-decoration: none;
           }
           .message-box {
-            background: white;
+            background: #f8f9fa;
             padding: 15px;
-            border-radius: 5px;
-            border-left: 3px solid #764ba2;
+            border-radius: 8px;
+            border-left: 3px solid ${PRIMARY_COLOR};
             white-space: pre-wrap;
             word-wrap: break-word;
+            font-size: 15px;
+            line-height: 1.7;
+          }
+          .feeling-badge {
+            display: inline-block;
+            background: ${PRIMARY_COLOR};
+            color: white;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+          }
+          .images-section {
+            margin-top: 20px;
+          }
+          .image-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 15px;
+            margin-top: 10px;
+          }
+          .image-item {
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px solid #e9ecef;
+          }
+          .image-item img {
+            width: 100%;
+            height: 150px;
+            object-fit: cover;
+            display: block;
+          }
+          .footer {
+            padding: 20px 30px;
+            background: #f8f9fa;
+            text-align: center;
+            font-size: 13px;
+            color: #6c757d;
           }
         </style>
       </head>
       <body>
-        <div class="header">
-          <h1>📬 New Feedback Received</h1>
-          <p>RECAP Project Hub</p>
-        </div>
-        <div class="content">
-          <div class="field">
-            <div class="label">From:</div>
-            <div class="value">${name}</div>
+        <div class="email-container">
+          <div class="header">
+            <h1>📬 New Feedback Received</h1>
+            <p>RECAP Project Hub</p>
           </div>
-          <div class="field">
-            <div class="label">Email:</div>
-            <div class="value"><a href="mailto:${email}">${email}</a></div>
+          <div class="content">
+            <div class="field">
+              <div class="label">From</div>
+              <div class="value">${name}</div>
+            </div>
+            <div class="field">
+              <div class="label">Email</div>
+              <div class="value"><a href="mailto:${email}">${email}</a></div>
+            </div>
+            <div class="field">
+              <div class="label">Feeling</div>
+              <div class="value">
+                <span class="feeling-badge">${feelingEmoji} ${feelingText}</span>
+              </div>
+            </div>
+            ${subject ? `<div class="field"><div class="label">Subject</div><div class="value">${subject}</div></div>` : ''}
+            <div class="field">
+              <div class="label">Message</div>
+              <div class="message-box">${message}</div>
+            </div>
+            ${images && images.length > 0 ? `
+              <div class="images-section">
+                <div class="label">Attached Images (${images.length})</div>
+                <div class="image-grid">
+                  ${images.map((url, idx) => `
+                    <div class="image-item">
+                      <a href="${url}" target="_blank">
+                        <img src="${url}" alt="Attachment ${idx + 1}" />
+                      </a>
+                    </div>
+                  `).join('')}
+                </div>
+              </div>
+            ` : ''}
           </div>
-          ${subject ? `<div class="field"><div class="label">Subject:</div><div class="value">${subject}</div></div>` : ''}
-          <div class="field">
-            <div class="label">Message:</div>
-            <div class="message-box">${message}</div>
+          <div class="footer">
+            <p>Sent from RECAP Project Hub Feedback System</p>
           </div>
         </div>
       </body>
@@ -1646,21 +2072,171 @@ app.post('/api/feedback', async (req, res) => {
     
     // Send user confirmation
     try {
+      const userEmailContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <style>
+            body {
+              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+              line-height: 1.6;
+              color: #333;
+              max-width: 600px;
+              margin: 0 auto;
+              padding: 20px;
+              background: #f5f5f5;
+            }
+            .email-container {
+              background: white;
+              border-radius: 12px;
+              overflow: hidden;
+              box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            }
+            .header {
+              background: ${PRIMARY_COLOR};
+              color: white;
+              padding: 40px 30px;
+              text-align: center;
+            }
+            .checkmark-wrapper {
+              display: inline-block;
+              width: 70px;
+              height: 70px;
+              background: rgba(255,255,255,0.2);
+              border-radius: 50%;
+              padding: 15px;
+              margin-bottom: 15px;
+            }
+            .checkmark {
+              width: 40px;
+              height: 40px;
+              stroke: white;
+              stroke-width: 4;
+              fill: none;
+            }
+            .header h1 {
+              margin: 0;
+              font-size: 28px;
+              font-weight: 700;
+            }
+            .content {
+              padding: 35px 30px;
+              text-align: center;
+            }
+            .greeting {
+              font-size: 18px;
+              color: #333;
+              margin-bottom: 10px;
+            }
+            .greeting strong {
+              color: ${PRIMARY_COLOR};
+            }
+            .message-preview {
+              background: #f8f9fa;
+              padding: 20px;
+              border-radius: 8px;
+              margin: 25px 0;
+              border-left: 4px solid ${PRIMARY_COLOR};
+              text-align: left;
+            }
+            .message-preview p {
+              margin: 0;
+              color: #6c757d;
+              font-style: italic;
+              line-height: 1.6;
+            }
+            .info-box {
+              background: rgba(8,212,136,0.08);
+              border: 1px solid ${PRIMARY_COLOR};
+              border-radius: 8px;
+              padding: 20px;
+              margin: 25px 0;
+            }
+            .info-item {
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              gap: 10px;
+              margin: 10px 0;
+              color: #333;
+              font-size: 15px;
+            }
+            .info-icon {
+              color: ${PRIMARY_COLOR};
+              font-size: 20px;
+            }
+            .footer {
+              padding: 25px 30px;
+              background: #f8f9fa;
+              text-align: center;
+            }
+            .footer p {
+              margin: 5px 0;
+              font-size: 14px;
+              color: #6c757d;
+            }
+            .team-signature {
+              color: ${PRIMARY_COLOR};
+              font-weight: 600;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="email-container">
+            <div class="header">
+              <div class="checkmark-wrapper">
+                <svg class="checkmark" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 52 52">
+                  <circle cx="26" cy="26" r="25"/>
+                  <path d="M14.1 27.2l7.1 7.2 16.7-16.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <h1>Thank You!</h1>
+            </div>
+            <div class="content">
+              <p class="greeting">Hi <strong>${name}</strong>! 👋</p>
+              <p style="color: #6c757d; margin-bottom: 20px;">
+                We've successfully received your feedback.
+              </p>
+              
+              <div class="message-preview">
+                <p>"${message.substring(0, 200)}${message.length > 200 ? '...' : ''}"</p>
+              </div>
+              
+              <div class="info-box">
+                <div class="info-item">
+                  <span class="info-icon">✓</span>
+                  <span>Your message has been sent to our team</span>
+                </div>
+                <div class="info-item">
+                  <span class="info-icon">📧</span>
+                  <span>We'll review and respond shortly</span>
+                </div>
+                ${feeling ? `
+                  <div class="info-item">
+                    <span class="info-icon">${feelingEmoji}</span>
+                    <span>You felt: ${feelingText}</span>
+                  </div>
+                ` : ''}
+              </div>
+              
+              <p style="color: #6c757d; font-size: 14px;">
+                If you have any urgent concerns, please reply to this email directly.
+              </p>
+            </div>
+            <div class="footer">
+              <p class="team-signature">— The RECAP Team</p>
+              <p>CTU Daanbantayan Campus • BSIT Program</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+      
       await transporter.sendMail({
         from: `"RECAP Team" <${process.env.SMTP_USER}>`,
         to: email,
         subject: 'Thank You for Your Feedback - RECAP',
-        html: `
-          <!DOCTYPE html>
-          <html>
-          <body style="font-family: sans-serif; padding: 20px;">
-            <h2 style="color: #667eea;">✅ Thank You, ${name}!</h2>
-            <p>We've received your feedback and will get back to you soon.</p>
-            <p style="color: #6c757d;"><em>"${message.substring(0, 150)}${message.length > 150 ? '...' : ''}"</em></p>
-            <p>— The RECAP Team</p>
-          </body>
-          </html>
-        `
+        html: userEmailContent
       });
       console.log('✓ User confirmation sent');
     } catch (confirmError) {

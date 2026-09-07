@@ -17,6 +17,7 @@
   "license": "ISC",
   "dependencies": {
     "@pinecone-database/pinecone": "^2.2.2",
+    "cloudinary": "^1.41.3",
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^4.22.2",
