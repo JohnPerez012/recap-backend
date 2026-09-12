@@ -97,14 +97,19 @@ console.log('✓ Using Inference API (automatic embeddings)');
 // ============================================
 // RESEND EMAIL CONFIGURATION
 // ============================================
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
-const RESEND_FROM_NAME = process.env.RESEND_FROM_NAME || 'RECAP Support';
-const FEEDBACK_RECIPIENT_EMAIL = process.env.FEEDBACK_RECIPIENT_EMAIL;
+const RESEND_API_KEY = process.env.RESEND_API_KEY ? process.env.RESEND_API_KEY.trim() : '';
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL ? process.env.RESEND_FROM_EMAIL.trim() : 'onboarding@resend.dev';
+const RESEND_FROM_NAME = process.env.RESEND_FROM_NAME ? process.env.RESEND_FROM_NAME.trim() : 'RECAP Support';
+const FEEDBACK_RECIPIENT_EMAIL = process.env.FEEDBACK_RECIPIENT_EMAIL ? process.env.FEEDBACK_RECIPIENT_EMAIL.trim() : '';
 
 if (RESEND_API_KEY) {
   console.log('✓ Resend API configured');
   console.log(`  From: ${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>`);
+  if (FEEDBACK_RECIPIENT_EMAIL) {
+    console.log(`  Admin Recipient: ${FEEDBACK_RECIPIENT_EMAIL}`);
+  } else {
+    console.log('  Admin Recipient: (Disabled - saving 1 email quota per feedback)');
+  }
 } else {
   console.warn('⚠️  Resend API key not configured. Feedback emails will not be sent.');
 }
@@ -1521,17 +1526,40 @@ app.post('/api/feedback', async (req, res) => {
       });
     }
     
-    // Check if Resend is configured
-    if (!RESEND_API_KEY) {
-      console.error('❌ Resend API not configured');
-      return res.status(503).json({
-        success: false,
-        error: 'Email service is not configured. Please contact the administrator.'
+    // 1. Always store feedback in Firestore first so no feedback is ever lost
+    try {
+      await db.collection('feedback').add({
+        name,
+        email,
+        subject: subject || 'General Feedback',
+        message,
+        status: 'unread',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        ipAddress: req.ip || 'unknown',
+        userAgent: req.headers['user-agent'] || 'unknown'
+      });
+      console.log('✓ Feedback stored in Firestore');
+    } catch (dbError) {
+      console.warn('⚠️ Failed to store in Firestore:', dbError.message);
+    }
+
+    // 2. Resend configuration with trimming to prevent whitespace/newline issues
+    const activeApiKey = (process.env.RESEND_API_KEY || RESEND_API_KEY || '').trim();
+    const activeRecipientEmail = (process.env.FEEDBACK_RECIPIENT_EMAIL || FEEDBACK_RECIPIENT_EMAIL || '').trim();
+    const activeFromEmail = (process.env.RESEND_FROM_EMAIL || RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
+    const activeFromName = (process.env.RESEND_FROM_NAME || RESEND_FROM_NAME || 'RECAP Support').trim();
+
+    // Check if Resend is configured - if not, feedback is still saved in Firestore
+    if (!activeApiKey) {
+      console.warn('⚠️ Resend API not configured. Feedback saved in database only.');
+      return res.json({
+        success: true,
+        message: 'Feedback received successfully!'
       });
     }
-    
+
     const feedbackSubject = subject || 'New Feedback - RECAP Project Hub';
-    const recipientEmail = FEEDBACK_RECIPIENT_EMAIL;
+    const recipientEmail = activeRecipientEmail;
     
     // Map feeling to emoji
     const feelingEmojis = {
@@ -1712,36 +1740,38 @@ app.post('/api/feedback', async (req, res) => {
       </html>
     `;
     
-    // Send admin notification via Resend API
-    console.log(`📤 Sending email to ${recipientEmail}...`);
-    
-    try {
-      const fromField = RESEND_FROM_NAME ? `${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>` : RESEND_FROM_EMAIL;
-      
-      const adminEmailResponse = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${RESEND_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          from: fromField,
-          to: recipientEmail,
-          reply_to: email,
-          subject: feedbackSubject,
-          html: htmlContent
-        })
-      });
-      
-      if (!adminEmailResponse.ok) {
-        const errorData = await adminEmailResponse.json();
-        throw new Error(`Admin email failed: ${errorData.message || adminEmailResponse.statusText}`);
+    // 3. Send admin notification via Resend API (OPTIONAL - only if FEEDBACK_RECIPIENT_EMAIL is configured)
+    if (recipientEmail) {
+      console.log(`📤 Sending admin notification email to ${recipientEmail}...`);
+      try {
+        const fromField = activeFromName ? `${activeFromName} <${activeFromEmail}>` : activeFromEmail;
+        
+        const adminEmailResponse = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${activeApiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            from: fromField,
+            to: recipientEmail,
+            reply_to: email,
+            subject: feedbackSubject,
+            html: htmlContent
+          })
+        });
+        
+        if (!adminEmailResponse.ok) {
+          const errorData = await adminEmailResponse.json().catch(() => ({}));
+          console.warn('⚠️ Admin email failed:', errorData.message || adminEmailResponse.statusText);
+        } else {
+          console.log('✓ Feedback admin email sent successfully to', recipientEmail);
+        }
+      } catch (emailError) {
+        console.warn('⚠️ Failed to send admin email:', emailError.message);
       }
-      
-      console.log('✓ Feedback email sent successfully to', recipientEmail);
-    } catch (emailError) {
-      console.error('❌ Failed to send admin email:', emailError);
-      throw new Error(`Email sending failed: ${emailError.message}`);
+    } else {
+      console.log('ℹ️ FEEDBACK_RECIPIENT_EMAIL not set — skipping admin email notification (saving 1 email quota per feedback)');
     }
     
     // Send user confirmation
@@ -1906,12 +1936,12 @@ app.post('/api/feedback', async (req, res) => {
         </html>
       `;
       
-      const fromField = RESEND_FROM_NAME ? `${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>` : RESEND_FROM_EMAIL;
+      const fromField = activeFromName ? `${activeFromName} <${activeFromEmail}>` : activeFromEmail;
       
       const userEmailResponse = await fetch('https://api.resend.com/emails', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${RESEND_API_KEY}`,
+          'Authorization': `Bearer ${activeApiKey}`,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -1932,22 +1962,7 @@ app.post('/api/feedback', async (req, res) => {
       console.warn('⚠️ Failed to send confirmation email:', confirmError.message);
     }
     
-    // Store in Firestore
-    try {
-      await db.collection('feedback').add({
-        name,
-        email,
-        subject: subject || 'General Feedback',
-        message,
-        status: 'unread',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        ipAddress: req.ip || 'unknown',
-        userAgent: req.headers['user-agent'] || 'unknown'
-      });
-      console.log('✓ Feedback stored in Firestore');
-    } catch (dbError) {
-      console.warn('⚠️ Failed to store in Firestore:', dbError.message);
-    }
+
     
     res.json({
       success: true,
