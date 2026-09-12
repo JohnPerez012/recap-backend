@@ -11,7 +11,6 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { Pinecone } = require('@pinecone-database/pinecone');
-const nodemailer = require('nodemailer');
 const fs = require('fs');
 let cloudinary = null;
 try {
@@ -96,36 +95,18 @@ console.log(`✓ Pinecone index: ${indexName}`);
 console.log('✓ Using Inference API (automatic embeddings)');
 
 // ============================================
-// NODEMAILER CONFIGURATION
+// RESEND EMAIL CONFIGURATION
 // ============================================
-let transporter;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+const RESEND_FROM_NAME = process.env.RESEND_FROM_NAME || 'RECAP Support';
+const FEEDBACK_RECIPIENT_EMAIL = process.env.FEEDBACK_RECIPIENT_EMAIL;
 
-try {
-  transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST || 'smtp.gmail.com',
-    port: parseInt(process.env.SMTP_PORT) || 587,
-    secure: process.env.SMTP_SECURE === 'true', // true for 465, false for other ports
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    }
-  });
-
-  // Verify SMTP connection
-  if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-    transporter.verify((error, success) => {
-      if (error) {
-        console.warn('⚠️  SMTP verification failed:', error.message);
-        console.warn('   Feedback emails may not work. Check your SMTP credentials.');
-      } else {
-        console.log('✓ SMTP transporter ready');
-      }
-    });
-  } else {
-    console.warn('⚠️  SMTP credentials not configured. Feedback emails will not be sent.');
-  }
-} catch (error) {
-  console.error('❌ Failed to initialize email transporter:', error.message);
+if (RESEND_API_KEY) {
+  console.log('✓ Resend API configured');
+  console.log(`  From: ${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>`);
+} else {
+  console.warn('⚠️  Resend API key not configured. Feedback emails will not be sent.');
 }
 
 // ============================================
@@ -1835,13 +1816,13 @@ process.on('uncaughtException', (error) => {
 
 /**
  * POST /api/feedback
- * Send feedback email via Nodemailer
+ * Send feedback email via Resend API
  */
 app.post('/api/feedback', async (req, res) => {
   try {
     const { name, email, feeling, subject, message, images } = req.body;
     
-    console.log('📧 Feedback request received:', { name, email, feeling: feeling || 'Not specified', subject: subject || 'No subject' });
+    console.log('📧 Processing feedback from:', email);
     
     // Validation
     if (!name || !email || !message) {
@@ -1860,19 +1841,17 @@ app.post('/api/feedback', async (req, res) => {
       });
     }
     
-    // Check if SMTP is configured
-    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-      console.error('❌ SMTP not configured');
+    // Check if Resend is configured
+    if (!RESEND_API_KEY) {
+      console.error('❌ Resend API not configured');
       return res.status(503).json({
         success: false,
         error: 'Email service is not configured. Please contact the administrator.'
       });
     }
     
-    console.log('✓ Validation passed, preparing emails...');
-    
     const feedbackSubject = subject || 'New Feedback - RECAP Project Hub';
-    const recipientEmail = process.env.FEEDBACK_RECIPIENT_EMAIL || process.env.SMTP_USER;
+    const recipientEmail = FEEDBACK_RECIPIENT_EMAIL;
     
     // Map feeling to emoji
     const feelingEmojis = {
@@ -2053,18 +2032,33 @@ app.post('/api/feedback', async (req, res) => {
       </html>
     `;
     
-    // Send admin notification
+    // Send admin notification via Resend API
     console.log(`📤 Sending email to ${recipientEmail}...`);
     
     try {
-      await transporter.sendMail({
-        from: `"RECAP Feedback" <${process.env.SMTP_USER}>`,
-        to: recipientEmail,
-        replyTo: email,
-        subject: feedbackSubject,
-        html: htmlContent
+      const fromField = RESEND_FROM_NAME ? `${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>` : RESEND_FROM_EMAIL;
+      
+      const adminEmailResponse = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${RESEND_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: fromField,
+          to: recipientEmail,
+          reply_to: email,
+          subject: feedbackSubject,
+          html: htmlContent
+        })
       });
-      console.log('✓ Admin notification sent');
+      
+      if (!adminEmailResponse.ok) {
+        const errorData = await adminEmailResponse.json();
+        throw new Error(`Admin email failed: ${errorData.message || adminEmailResponse.statusText}`);
+      }
+      
+      console.log('✓ Feedback email sent successfully to', recipientEmail);
     } catch (emailError) {
       console.error('❌ Failed to send admin email:', emailError);
       throw new Error(`Email sending failed: ${emailError.message}`);
