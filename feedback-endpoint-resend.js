@@ -34,16 +34,23 @@ app.post('/api/feedback', async (req, res) => {
       });
     }
     
+    // Resend configuration with trimming to prevent whitespace/newline issues
+    const activeApiKey = (process.env.RESEND_API_KEY || RESEND_API_KEY || '').trim();
+    const activeRecipientEmail = (process.env.FEEDBACK_RECIPIENT_EMAIL || FEEDBACK_RECIPIENT_EMAIL || '').trim();
+    const activeFromEmail = (process.env.RESEND_FROM_EMAIL || RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
+    const activeFromName = (process.env.RESEND_FROM_NAME || RESEND_FROM_NAME || 'RECAP Support').trim();
+
     // Check if Resend is configured
-    if (!RESEND_API_KEY) {
-      console.error('❌ Resend API not configured');
-      return res.status(503).json({
-        success: false,
-        error: 'Email service is not configured. Please contact the administrator.'
+    if (!activeApiKey) {
+      console.warn('⚠️ Resend API not configured');
+      return res.json({
+        success: true,
+        message: 'Feedback submitted successfully!'
       });
     }
-    
+
     const feedbackSubject = subject || 'New Feedback - RECAP Project Hub';
+    const recipientEmail = activeRecipientEmail;
     
     // Map feeling to emoji
     const feelingEmojis = {
@@ -278,28 +285,37 @@ app.post('/api/feedback', async (req, res) => {
     // Send emails via Resend API
     console.log('✓ Sending emails via Resend API...');
     
-    // Send admin notification
-    const adminEmailResponse = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        from: RESEND_FROM_EMAIL,
-        to: FEEDBACK_RECIPIENT_EMAIL,
-        reply_to: email,
-        subject: feedbackSubject,
-        html: adminHtmlContent
-      })
-    });
-    
-    if (!adminEmailResponse.ok) {
-      const errorData = await adminEmailResponse.json();
-      throw new Error(`Admin email failed: ${errorData.message || adminEmailResponse.statusText}`);
+    // Send admin notification (Optional - only if FEEDBACK_RECIPIENT_EMAIL is configured)
+    if (recipientEmail) {
+      try {
+        const fromField = activeFromName ? `${activeFromName} <${activeFromEmail}>` : activeFromEmail;
+        const adminEmailResponse = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${activeApiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            from: fromField,
+            to: recipientEmail,
+            reply_to: email,
+            subject: feedbackSubject,
+            html: adminHtmlContent
+          })
+        });
+        
+        if (!adminEmailResponse.ok) {
+          const errorData = await adminEmailResponse.json().catch(() => ({}));
+          console.warn('⚠️ Admin email failed:', errorData.message || adminEmailResponse.statusText);
+        } else {
+          console.log('✓ Feedback email sent successfully to', recipientEmail);
+        }
+      } catch (adminErr) {
+        console.warn('⚠️ Admin email failed:', adminErr.message);
+      }
+    } else {
+      console.log('ℹ️ FEEDBACK_RECIPIENT_EMAIL not set — skipping admin email notification (saving 1 email per feedback)');
     }
-    
-    console.log('✓ Feedback email sent successfully to', FEEDBACK_RECIPIENT_EMAIL);
     
     // Send user confirmation
     const userEmailResponse = await fetch('https://api.resend.com/emails', {

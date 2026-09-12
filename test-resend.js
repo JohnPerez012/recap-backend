@@ -20,9 +20,10 @@ if (!RESEND_API_KEY) {
   process.exit(1);
 }
 
+const targetEmail = FEEDBACK_RECIPIENT_EMAIL || 'delivered@resend.dev';
+
 if (!FEEDBACK_RECIPIENT_EMAIL) {
-  console.error('❌ FEEDBACK_RECIPIENT_EMAIL is not set in .env file');
-  process.exit(1);
+  console.log('ℹ️ FEEDBACK_RECIPIENT_EMAIL not set, sending to Resend test sink (delivered@resend.dev)');
 }
 
 async function testResend() {
@@ -37,7 +38,7 @@ async function testResend() {
       },
       body: JSON.stringify({
         from: RESEND_FROM_EMAIL,
-        to: FEEDBACK_RECIPIENT_EMAIL,
+        to: targetEmail,
         subject: 'Test Email - RECAP Backend',
         html: `
           <html>
@@ -48,9 +49,9 @@ async function testResend() {
               <ul>
                 <li>API Key: ${RESEND_API_KEY.slice(0, 15)}...</li>
                 <li>From: ${RESEND_FROM_EMAIL}</li>
-                <li>To: ${FEEDBACK_RECIPIENT_EMAIL}</li>
+                <li>To: ${targetEmail}</li>
               </ul>
-              <p>You're all set to receive feedback emails! 🎉</p>
+              <p>You're all set to send feedback emails! 🎉</p>
             </body>
           </html>
         `
@@ -67,7 +68,7 @@ async function testResend() {
     const data = await response.json();
     console.log('✅ Email sent successfully!');
     console.log('📬 Email ID:', data.id);
-    console.log('📨 Check your inbox at:', FEEDBACK_RECIPIENT_EMAIL);
+    console.log('📨 Check inbox at:', targetEmail);
     console.log('\n✅ Resend API is working perfectly!\n');
     
   } catch (error) {
