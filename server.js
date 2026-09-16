@@ -1434,6 +1434,125 @@ app.delete('/api/cloudinary/delete', async (req, res) => {
 });
 
 // ============================================
+// USER MANAGEMENT ENDPOINTS
+// ============================================
+
+/**
+ * Helper function to handle user deletion from Firebase Auth and Firestore
+ */
+async function handleUserDeletion(uid, email, res) {
+  if (!uid && !email) {
+    return res.status(400).json({
+      success: false,
+      message: 'User UID or email is required'
+    });
+  }
+
+  console.log(`\n🗑️  [USER DELETE] Request to delete user: UID=${uid || 'N/A'}, Email=${email || 'N/A'}`);
+
+  let authDeleted = false;
+  let targetUid = uid;
+  let authMessage = '';
+
+  // 1. Try deleting from Firebase Authentication by UID
+  if (targetUid) {
+    try {
+      await admin.auth().deleteUser(targetUid);
+      authDeleted = true;
+      authMessage = `Deleted user ${targetUid} from Firebase Authentication`;
+      console.log(`✓ ${authMessage}`);
+    } catch (authError) {
+      if (authError.code === 'auth/user-not-found') {
+        console.log(`ℹ️ User UID ${targetUid} not found in Firebase Authentication (already deleted)`);
+        authDeleted = true;
+        authMessage = 'User already absent from Firebase Authentication';
+      } else {
+        console.warn(`⚠️ Firebase Auth delete by UID failed: ${authError.message}`);
+      }
+    }
+  }
+
+  // 2. Fallback: If not deleted and email is provided, lookup by email and delete
+  if (!authDeleted && email) {
+    try {
+      const userRecord = await admin.auth().getUserByEmail(email);
+      targetUid = userRecord.uid;
+      await admin.auth().deleteUser(userRecord.uid);
+      authDeleted = true;
+      authMessage = `Deleted user ${userRecord.uid} (${email}) from Firebase Authentication via email lookup`;
+      console.log(`✓ ${authMessage}`);
+    } catch (emailError) {
+      if (emailError.code === 'auth/user-not-found') {
+        console.log(`ℹ️ User with email ${email} not found in Firebase Authentication`);
+        authDeleted = true;
+        authMessage = 'User already absent from Firebase Authentication';
+      } else {
+        console.error(`❌ Firebase Auth delete by email lookup failed: ${emailError.message}`);
+        authMessage = emailError.message;
+      }
+    }
+  }
+
+  // 3. Delete user document from Firestore
+  let firestoreDeleted = false;
+  if (targetUid) {
+    try {
+      const userDocRef = db.collection('users').doc(targetUid);
+      const doc = await userDocRef.get();
+      if (doc.exists) {
+        await userDocRef.delete();
+        firestoreDeleted = true;
+        console.log(`✓ Deleted Firestore document for user ${targetUid}`);
+      } else {
+        firestoreDeleted = true;
+        console.log(`ℹ️ Firestore document for user ${targetUid} already absent`);
+      }
+    } catch (fsError) {
+      console.warn(`⚠️ Firestore document deletion warning: ${fsError.message}`);
+    }
+  }
+
+  return res.json({
+    success: true,
+    message: 'User deletion processed successfully',
+    authDeleted,
+    firestoreDeleted,
+    uid: targetUid,
+    details: authMessage
+  });
+}
+
+/**
+ * DELETE /api/users/:uid
+ * Delete user from Firebase Authentication and Firestore
+ */
+app.delete('/api/users/:uid', async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const { email } = req.body || {};
+    return await handleUserDeletion(uid, email, res);
+  } catch (err) {
+    console.error('❌ Error in DELETE /api/users/:uid:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /api/users/delete
+ * Fallback POST endpoint for deleting user
+ */
+app.post('/api/users/delete', async (req, res) => {
+  try {
+    const { uid, userId, email } = req.body || {};
+    const targetUid = uid || userId;
+    return await handleUserDeletion(targetUid, email, res);
+  } catch (err) {
+    console.error('❌ Error in POST /api/users/delete:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 app.get('/api/health', (req, res) => {
@@ -1476,10 +1595,12 @@ app.listen(PORT, () => {
   console.log(`    3. ${AI_PROVIDERS.gemini.name} ${AI_PROVIDERS.gemini.apiKey ? '✓' : '✗'}`);
   console.log(`    4. ${AI_PROVIDERS.openrouter.name} ${AI_PROVIDERS.openrouter.apiKey ? '✓' : '✗'}`);
   console.log(`\n🌐 Endpoints:`);
-  console.log(`    POST /api/pinecone/search - RAG semantic search`);
-  console.log(`    POST /api/chat - AI chat with fallback`);
-  console.log(`    POST /api/feedback - Send feedback email`);
-  console.log(`    GET  /api/health - Health check`);
+  console.log(`    POST   /api/pinecone/search - RAG semantic search`);
+  console.log(`    POST   /api/chat - AI chat with fallback`);
+  console.log(`    POST   /api/feedback - Send feedback email`);
+  console.log(`    DELETE /api/users/:uid - Delete user from Auth & Firestore`);
+  console.log(`    POST   /api/users/delete - Delete user fallback`);
+  console.log(`    GET    /api/health - Health check`);
   console.log(`${'='.repeat(50)}\n`);
 });
 
