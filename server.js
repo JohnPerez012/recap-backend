@@ -182,9 +182,9 @@ const AI_PROVIDERS = {
   
   gemini: { // Third
     name: 'Google Gemini',
-    endpoint: (apiKey) => `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`,
-    streamEndpoint: (apiKey) => `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:streamGenerateContent?alt=sse&key=${apiKey}`,
-    model: 'gemini-flash-latest',
+    endpoint: (apiKey) => `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
+    streamEndpoint: (apiKey) => `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse&key=${apiKey}`,
+    model: 'gemini-3.5-flash',
     apiKey: process.env.GEMINI_API_KEY,
     headers: () => ({
       'Content-Type': 'application/json'
@@ -223,7 +223,7 @@ const AI_PROVIDERS = {
     name: 'OpenRouter',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     streamEndpoint: 'https://openrouter.ai/api/v1/chat/completions',
-    model: 'google/gemma-4-26b-a4b-it:free',
+    model: 'inclusionai/ling-3.0-flash-sante:free',
     apiKey: process.env.OPENROUTER_API_KEY,
     headers: (apiKey) => ({
       'Authorization': `Bearer ${apiKey}`,
@@ -232,14 +232,14 @@ const AI_PROVIDERS = {
       'X-Title': 'RECAP Project Hub'
     }),
     formatRequest: (messages, maxTokens, stream = false) => ({
-      model: 'google/gemma-4-26b-a4b-it:free',
+      model: 'inclusionai/ling-3.0-flash-sante:free',
       messages,
       max_tokens: maxTokens,
       temperature: 0.7,
       stream: !!stream
     }),
-    extractResponse: (data) => data.choices[0].message.content,
-    extractStreamDelta: (json) => json.choices?.[0]?.delta?.content || ''
+    extractResponse: (data) => data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning || '',
+    extractStreamDelta: (json) => json.choices?.[0]?.delta?.content || json.choices?.[0]?.delta?.reasoning || ''
   }
 };
 
@@ -391,10 +391,26 @@ async function streamFromAIProvider(providerKey, messages, maxTokens = 1000, onT
 }
 
 /**
+ * Resolves the provider cascade order based on user preference
+ */
+function getProviderSequence(preferredKey) {
+  const defaultOrder = ['mistral', 'groq', 'gemini', 'openrouter'];
+  if (!preferredKey) return defaultOrder;
+  const normalized = String(preferredKey).toLowerCase().replace(/\s+/g, '');
+  let match = null;
+  if (normalized.includes('mistral')) match = 'mistral';
+  else if (normalized.includes('groq')) match = 'groq';
+  else if (normalized.includes('gemini')) match = 'gemini';
+  else if (normalized.includes('openrouter')) match = 'openrouter';
+  if (!match) return defaultOrder;
+  return [match, ...defaultOrder.filter(k => k !== match)];
+}
+
+/**
  * 4-Tier cascading fallback system with real-time SSE streaming
  */
 async function streamAIWithFallback(messages, maxTokens = 1000, res, metadata = {}) {
-  const providers = ['mistral', 'groq', 'gemini', 'openrouter'];
+  const providers = getProviderSequence(metadata.preferredProvider);
   const errors = [];
   
   for (let i = 0; i < providers.length; i++) {
@@ -483,8 +499,8 @@ async function streamAIWithFallback(messages, maxTokens = 1000, res, metadata = 
 /**
  * 4-Tier cascading fallback system (Non-streaming)
  */
-async function callAIWithFallback(messages, maxTokens = 1000) {
-  const providers = ['mistral', 'groq', 'gemini', 'openrouter'];
+async function callAIWithFallback(messages, maxTokens = 1000, preferredKey = null) {
+  const providers = getProviderSequence(preferredKey);
   const errors = [];
   
   for (let i = 0; i < providers.length; i++) {
@@ -1131,7 +1147,7 @@ app.post('/api/pinecone/search', async (req, res) => {
  */
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, conversationHistory = [], relevantProjects = [], stream = true } = req.body;
+    const { message, conversationHistory = [], relevantProjects = [], stream = true, preferredProvider } = req.body;
     
     if (!message) {
       return res.status(400).json({ error: 'Message is required' });
@@ -1175,8 +1191,10 @@ RESPONSE STRATEGY:
    c) If asked about trends → synthesize across all provided projects
    d) If asked about specifics (methods, findings) → quote relevant abstract sections
 
-10. Citation Format:
+10. Citation Format & Project Links:
     - Always mention project title when referencing data
+    - Format project titles as: **[Project Title]** or [Project Title](#project)
+    - FORBIDDEN: NEVER invent or hallucinate fake external URLs or web domains (e.g. do NOT write "https://recap.projecthub.org/...", "http://...", or any external URLs). All capstone projects exist within the local RE-CAPS repository.
     - Example: "According to **[Project Title]** by [Authors], ..."
     - Show relevance percentage for transparency: "(92% match)"
 
@@ -1289,10 +1307,10 @@ ALLOWED: You may explain what this platform does and how it will work once proje
         res.flushHeaders();
       }
 
-      await streamAIWithFallback(messages, 1000, res, { projectsUsed: relevantProjects.length });
+      await streamAIWithFallback(messages, 1000, res, { projectsUsed: relevantProjects.length, preferredProvider });
     } else {
       // Non-streaming fallback
-      const result = await callAIWithFallback(messages, 1000);
+      const result = await callAIWithFallback(messages, 1000, preferredProvider);
       
       if (result.success) {
         res.json({
@@ -1549,6 +1567,137 @@ app.post('/api/users/delete', async (req, res) => {
   } catch (err) {
     console.error('❌ Error in POST /api/users/delete:', err);
     return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /api/users/create-librarian
+ * Create librarian user in Firebase Authentication & Firestore via Admin SDK
+ * Never affects or resets the active admin session on the frontend
+ */
+app.post('/api/users/create-librarian', async (req, res) => {
+  try {
+    // 0. Authenticate caller: require a valid Firebase ID token belonging to an admin
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, message: 'Missing authentication token' });
+    }
+
+    let callerUid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      callerUid = decoded.uid;
+    } catch (tokenErr) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired authentication token' });
+    }
+
+    const callerDoc = await db.collection('users').doc(callerUid).get();
+    if (!callerDoc.exists || callerDoc.data().userType !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Only administrators can create librarian accounts' });
+    }
+
+    const { email, password, fullName } = req.body || {};
+    const adminUid = callerUid;
+
+    if (!email || !password || !fullName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Full name, email, and password are required'
+      });
+    }
+
+    const trimmedEmail = email.trim().toLowerCase();
+    const trimmedName = fullName.trim();
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters'
+      });
+    }
+
+    // 1. Create user in Firebase Authentication
+    let userRecord;
+    try {
+      userRecord = await admin.auth().createUser({
+        email: trimmedEmail,
+        password: password,
+        displayName: trimmedName
+      });
+      console.log(`✓ Created Firebase Auth user: ${userRecord.uid} (${trimmedEmail})`);
+    } catch (authErr) {
+      console.error('❌ Firebase Auth createUser error:', authErr);
+      if (authErr.code === 'auth/email-already-exists') {
+        return res.status(409).json({
+          success: false,
+          code: authErr.code,
+          message: 'An account with this email address already exists'
+        });
+      }
+      if (authErr.code === 'auth/invalid-email') {
+        return res.status(400).json({
+          success: false,
+          code: authErr.code,
+          message: 'The email address is invalid'
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        code: authErr.code,
+        message: authErr.message || 'Failed to create user in authentication system'
+      });
+    }
+
+    // 2. Set custom user claims for role (optional but best practice for security rules)
+    try {
+      await admin.auth().setCustomUserClaims(userRecord.uid, { role: 'librarian' });
+    } catch (claimErr) {
+      console.warn('⚠️ Could not set custom claims:', claimErr.message);
+    }
+
+    // 3. Create Firestore document in 'users' collection
+    try {
+      await db.collection('users').doc(userRecord.uid).set({
+        email: trimmedEmail,
+        fullName: trimmedName,
+        userType: 'librarian',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdBy: adminUid || 'admin',
+        lastLogin: null,
+        photoURL: null
+      });
+      console.log(`✓ Created Firestore profile for librarian: ${userRecord.uid}`);
+    } catch (fsErr) {
+      console.error('❌ Firestore write error for new librarian:', fsErr);
+      // Clean up auth user if firestore write failed
+      try {
+        await admin.auth().deleteUser(userRecord.uid);
+      } catch (cleanupErr) {
+        console.error('❌ Failed to cleanup auth user after firestore error:', cleanupErr);
+      }
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create librarian record in database'
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'Librarian account created successfully',
+      user: {
+        uid: userRecord.uid,
+        email: trimmedEmail,
+        fullName: trimmedName,
+        userType: 'librarian'
+      }
+    });
+  } catch (err) {
+    console.error('❌ Error in /api/users/create-librarian:', err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || 'Internal server error while creating librarian'
+    });
   }
 });
 
