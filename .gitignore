@@ -1,20 +1,46 @@
+# Dependencies
 node_modules/
 package-lock.json
+yarn.lock
+pnpm-lock.yaml
 
-# Environment variables
+# Environment variables & secrets (NEVER commit secrets!)
 .env
-
-# Firebase service account key (NEVER commit this!)
+.env.*
+*.env
 serviceAccountKey.json
+serviceAccount*.json
+*.pem
+*.key
+*.cert
 seed-admin.js
 
-# Logs
+# Test & scratch scripts (local verification only)
+test-*.js
+test-*.bat
+test-*.sh
+test-*.ps1
+scratch/
+tmp/
+temp/
+
+# Logs & debugging
 *.log
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# OS files
+# OS & Editor files
 .DS_Store
 Thumbs.db
+ehthumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
 
+# Documentation (only commit main README)
 *.md
 !README.md
