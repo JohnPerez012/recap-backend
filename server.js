@@ -1393,6 +1393,158 @@ app.post('/api/chat/gemini', (req, res) => handleSingleProviderChat('gemini', re
 app.post('/api/chat/openrouter', (req, res) => handleSingleProviderChat('openrouter', req, res));
 
 // ============================================
+// STAFF COPILOT RAG ENDPOINT (ADMIN & LIBRARIAN)
+// ============================================
+/**
+ * POST /api/staff-copilot/chat
+ * Role-Based RAG Copilot for Head Librarian (Admin) and Library Staff (Librarian)
+ * Vector Index: recaps-staff-copilot (multilingual-e5-large)
+ */
+app.post('/api/staff-copilot/chat', async (req, res) => {
+  try {
+    const { message, userRole = 'admin', history = [] } = req.body;
+
+    if (!message || message.trim() === '') {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
+    const role = (userRole === 'librarian') ? 'librarian' : 'admin';
+    const staffCopilotHost = process.env.PINECONE_STAFF_COPILOT_HOST || 'recaps-staff-copilot-wf1edxk.svc.aped-4627-b74a.pinecone.io';
+
+    console.log(`\n🤖 Staff Copilot Query [Role: ${role}]: "${message.substring(0, 60)}..."`);
+
+    // Step 1: Embed query using Pinecone Inference API
+    let retrievedChunks = [];
+    try {
+      const embedResponse = await fetch('https://api.pinecone.io/embed', {
+        method: 'POST',
+        headers: {
+          'Api-Key': process.env.PINECONE_API_KEY,
+          'Content-Type': 'application/json',
+          'X-Pinecone-Api-Version': '2024-10'
+        },
+        body: JSON.stringify({
+          model: 'multilingual-e5-large',
+          parameters: {
+            input_type: 'query',
+            truncate: 'END'
+          },
+          inputs: [{ text: message }]
+        })
+      });
+
+      if (embedResponse.ok) {
+        const embedData = await embedResponse.json();
+        const queryVector = embedData.data[0].values;
+
+        // Step 2: Query Pinecone with Role-Based Metadata Filter
+        const roleFilter = (role === 'librarian')
+          ? { role_scope: { $in: ['librarian', 'shared'] } }
+          : { role_scope: { $in: ['admin', 'librarian', 'shared'] } };
+
+        const queryUrl = `https://${staffCopilotHost}/query`;
+        const pineconeRes = await fetch(queryUrl, {
+          method: 'POST',
+          headers: {
+            'Api-Key': process.env.PINECONE_API_KEY,
+            'Content-Type': 'application/json',
+            'X-Pinecone-Api-Version': '2025-04'
+          },
+          body: JSON.stringify({
+            vector: queryVector,
+            topK: 3,
+            includeMetadata: true,
+            filter: roleFilter
+          })
+        });
+
+        if (pineconeRes.ok) {
+          const queryResult = await pineconeRes.json();
+          retrievedChunks = (queryResult.matches || []).map(m => ({
+            id: m.id,
+            score: m.score,
+            title: m.metadata?.title || '',
+            category: m.metadata?.category || '',
+            landmark: m.metadata?.landmark || '',
+            text: m.metadata?.text || ''
+          }));
+          console.log(`✓ Retrieved ${retrievedChunks.length} RAG guidance chunks from Pinecone (top score: ${retrievedChunks[0]?.score?.toFixed(3) || 0})`);
+        } else {
+          console.warn('⚠️ Pinecone staff copilot query failed:', await pineconeRes.text());
+        }
+      }
+    } catch (ragErr) {
+      console.warn('⚠️ Staff Copilot RAG retrieval error (falling back to baseline instructions):', ragErr.message);
+    }
+
+    // Step 3: Construct Grounded System Prompt
+    const rolePersona = (role === 'librarian')
+      ? `You are the RE-CAPS Librarian Cataloging Assistant for Cebu Technological University (CTU) Daanbantayan Campus Library.
+Your role is to guide the library staff member on catalog intake, physical book shelf numbering, call numbers, accession codes, and drafting thesis submissions.
+CRITICAL ROLE BOUNDARY: If the user asks how to approve, directly publish, or delete catalog records, explain politely and clearly that these administrative governance actions require evaluation and action by the Head Librarian / Administrator.`
+      : `You are the RE-CAPS Executive Librarian AI Copilot for Cebu Technological University (CTU) Daanbantayan Campus Library.
+Your role is to guide the Head Librarian & Administrator on complete operational governance: evaluating and approving librarian submissions, syncing Pinecone AI search, bulk importing spreadsheets, unlocking and deleting records, printing Dean/CHED accreditation reports, and maintenance mode.`;
+
+    let systemPrompt = `${rolePersona}
+
+MANDATORY 3-TIER RESPONSE SYNTAX (Follow this exact structure for operational guidance):
+1. SPATIAL LANDMARK: Start with the exact visual location on the screen, e.g.:
+   [Area: <Section/Modal Name>] > [Element: <Button Name, Color & Icon>]
+2. STEP-BY-STEP ACTION: Clear, concise numbered steps (1, 2, 3...) explaining what to click, input, or inspect.
+3. PRECAUTION / POLICY ALERT: Start with ⚠️ Precaution: followed by any critical policy rule, security note, or data risk.
+
+GROUNDING RULE: Base your guidance strictly on the verified Library Documentation Context below. NEVER hallucinate button locations, colors, or procedures.`;
+
+    if (retrievedChunks.length > 0) {
+      systemPrompt += `\n\n--- VERIFIED LIBRARY DOCUMENTATION CONTEXT (PINECONE RAG) ---\n`;
+      retrievedChunks.forEach((chunk, i) => {
+        systemPrompt += `\n[Context Item ${i + 1}: ${chunk.title}]\nLandmark: ${chunk.landmark}\n${chunk.text}\n`;
+      });
+      systemPrompt += `\n-----------------------------------------------------------`;
+    }
+
+    // Build messages array
+    const messages = [
+      { role: 'system', content: systemPrompt }
+    ];
+
+    // Add recent history if provided
+    if (Array.isArray(history) && history.length > 0) {
+      history.slice(-4).forEach(h => {
+        if (h.role && h.content) {
+          messages.push({ role: h.role, content: h.content });
+        }
+      });
+    }
+
+    messages.push({ role: 'user', content: message });
+
+    // Step 4: Call cascading AI fallback engine
+    const aiResult = await callAIWithFallback(messages, 800);
+
+    if (aiResult.success) {
+      return res.json({
+        success: true,
+        reply: aiResult.response,
+        provider: aiResult.provider,
+        role,
+        ragRetrieved: retrievedChunks.length > 0,
+        sources: retrievedChunks.map(c => ({ title: c.title, landmark: c.landmark, score: c.score }))
+      });
+    } else {
+      return res.status(500).json({
+        success: false,
+        error: aiResult.message || 'All AI providers are currently unavailable'
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Staff Copilot endpoint error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
 // CLOUDINARY IMAGE DELETION
 // ============================================
 /**
