@@ -93,11 +93,11 @@ File Constraints: PNG, JPG, or WEBP up to 10MB per image. First uploaded image s
     landmark: 'Librarian Dashboard > Catalog Intake Tab > "+ Propose New Thesis"',
     text: `Librarian Staff Workflow for Cataloging Theses:
 Step 1: Click "Catalog Intake" on the left sidebar rail of the Librarian Portal.
-Step 2: Click the green "+ Propose New Thesis" button.
-Step 3: Enter Title, Authors (comma-separated), Academic Program, Adviser, Batch Year, and Abstract.
-Step 4: Fill in Section 04: Physical Shelf Location Note, Call Number, and Accession Number.
-Step 5: Upload 4 to 6 representation photos.
-Step 6: Click "Submit for Admin Approval".
+Step 2: Click the "+ Propose New Thesis" button to open the submission form (#upload-metadata-modal).
+Step 3: Fill in Section 01 (Core Identity): Project Title and Authors (added individually).
+Step 4: Fill in Section 02 (Academic Details): Program (BSFi, BSIT, BSHM, BSIE, BSEd-Math, BEEd, BIT-Computer, BIT-Electronics, BIT-Automotive, BTLEd-HE), Academic Year, and Faculty Adviser. Note: Status is automatically locked to "Pending Approval".
+Step 5: Fill in Section 03 (Research Content) and Section 04 (Book & Representation Images): enter Abstract, research Topics, Keywords, and upload 4 to 6 physical book photos (front cover, signed approval sheet, system diagram, and spine).
+Step 6: Click "Submit for Approval" (#um-submit-btn).
 Status lifecycle: The proposal will enter "Pending Approval" state. It will not be visible on the public website until the Head Librarian (Admin) reviews and approves it.`
   },
   {
@@ -119,13 +119,55 @@ Status lifecycle: The proposal will enter "Pending Approval" state. It will not 
     landmark: 'System Role Boundaries Notice',
     text: `Librarian Staff Permissions and Restrictions:
 Permissions:
-• Add new capstone thesis drafts with physical shelf metadata and call numbers.
+• Add new capstone thesis drafts with complete metadata and physical book photos.
 • Upload book representation photos and manuscript abstracts.
 • View shelf inventory and track personal submission history.
 Restrictions:
 • Librarians CANNOT directly publish theses to the live repository without Admin evaluation.
 • Librarians CANNOT delete approved projects (deletion is locked and admin-restricted).
 • Librarians CANNOT trigger Pinecone AI vector syncing or toggle Maintenance Mode.`
+  },
+
+  // --- ADMIN ROLE SCOPE: PROJECTS & INTAKE ---
+  {
+    id: 'admin_add_new_project_procedure',
+    title: 'Adding and Uploading a Capstone Project as Administrator',
+    category: 'projects_cataloging',
+    role_scope: ['admin'],
+    landmark: 'Projects Section > Table Header Action Bar > "+ Add Project" (Emerald Green Button #add-project-btn)',
+    text: `How Administrator Adds and Uploads a Capstone Project to the Repository:
+Landmark: [Area: Projects Section] > [Element: "+ Add Project" Button (emerald green with + icon, #add-project-btn, located in the table action bar beside Search)].
+Step 1: Click "Projects" in the left sidebar rail (#rail-nav-projects).
+Step 2: Click the emerald green "+ Add Project" button (#add-project-btn) to open the Add Project modal (#project-modal).
+Step 3: Fill in Section 01 (Core Identity): Enter Project Title (#project-title) and Authors (#project-authors, comma-separated full names).
+Step 4: Fill in Section 02 (Academic Details): Select Academic Program from the dropdown (#project-program: BSFi, BSIT, BSHM, BSIE, BSEd-Math, BEEd, BIT-Computer, BIT-Electronics, BIT-Automotive, BTLEd-HE), Academic Year (#project-year, e.g. 2023-2024), and Faculty Adviser (#project-adviser). Status is automatically set to "Published".
+Step 5: Fill in Section 03 (Research Content): Enter Abstract (#project-abstract) and search Keywords (#project-keywords).
+Step 6: Fill in Section 04 (Physical Book & Shelf Details): Enter Physical Location Note (#project-location, e.g., "Rack 1, Row 2, Stand 3, Color Blue"), Call Number (#project-call-number, e.g., "025.5 / Dea / 2024"), Accession Number (#project-accession, e.g., "CTU-2024-001"), and upload 4 to 6 physical book representation photos (cover, signed certificate, spine, diagrams).
+Step 7: Click "Save Capstone Project" (#save-project-btn). As an Administrator, your submission is directly published to the institutional catalog without requiring an approval review.
+Precaution: Accession numbers must be unique across all institutional holdings. For bulk uploading multiple theses from a spreadsheet, click the blue "Bulk Import" button (#bulk-import-btn) instead.`
+  },
+  {
+    id: 'admin_view_browse_existing_projects',
+    title: 'Navigating, Searching, and Browsing Existing Projects in Catalog',
+    category: 'projects_cataloging',
+    role_scope: ['admin'],
+    landmark: 'Sidebar Rail > "Projects" (2nd item from top, Document icon) > All Projects Section',
+    text: `How Administrator Navigates, Searches, and Browses Existing Projects:
+Landmark: [Area: Sidebar Rail] > [Element: "Projects" Nav Item (2nd tab from top, Document icon, glows emerald #08D488 when active)].
+Step 1: Click "Projects" in the left sidebar rail to open the All Projects section (#section-projects).
+Step 2: Table Overview: The catalog displays all published capstones with columns: Title (with Pinecone sync dot 🟢/🔴), Authors, Program, Year, Adviser, and Actions.
+Step 3: Instant Filtering: Click any of the one-click Filter Pills (#project-filters) directly above the table:
+• "All Projects"
+• Program pills: "BSFi", "BSIT", "BSHM", "BSIE", "BSEd-Math", "BEEd", "BIT-Computer", "BIT-Electronics", "BIT-Automotive", "BTLEd-HE"
+• Time filter: "Recent (30 days)"
+• Sync filter: "🔴 Unsynced" (filters capstones not yet embedded into Pinecone AI search)
+Step 4: Real-time Search: Type any keyword into the search bar (#projects-search) to instantly filter across title, author names, or keywords.
+Step 5: Row Actions Column:
+• View Details (Eye icon): Opens the project view modal with complete manuscript details and physical shelf location.
+• Edit Record (Pencil icon): Opens the project edit modal (#project-modal) to update metadata.
+• Unlock / Lock (Gold lock icon): Unlocks the project row to permit administrative deletion.
+• Delete (Trash bin icon): Permanently purges the project from Firestore and Pinecone vector search.
+Precaution: Modifying or deleting cataloged projects directly impacts the live student repository and Pinecone vector embeddings. Always unlock records with care.`
   },
 
   // --- ADMIN ROLE SCOPE: EVALUATIONS & APPROVALS ---
@@ -136,13 +178,13 @@ Restrictions:
     role_scope: ['admin'],
     landmark: 'Admin Sidebar Rail > Approvals (Checkmark Badge) OR Dashboard > "Pending Approvals" Card',
     text: `How Administrator Evaluates & Approves Submissions:
-Landmark: Click "Approvals" in the left sidebar rail (or click the amber "Pending Approvals" KPI card).
-Step 1: In the Pending Approvals table, find the thesis row and click the green "Evaluate" button.
-Step 2: Review core metadata: verify thesis title, correct author capitalization, and designated adviser.
-Step 3: Review Section 02 Classification: ensure academic program matches the curriculum.
-Step 4: Review Section 04 Physical Shelf: confirm Shelf Location Note, Call Number, and unique Accession Number.
-Step 5: Click "Approve & Publish" (Emerald button) to immediately release to the public repository, or click "Reject" to return with remarks.
-Precaution: Approved projects are instantly published and queued for AI vector search sync.`
+Landmark: Click "Approvals" in the left sidebar rail (or click the amber "Pending Approvals" KPI card on the dashboard).
+Step 1: Locate the target thesis submission in the Librarian Submissions table (#approvals-table). Click the "Evaluate" button (Eye icon, #approval-review-modal trigger) in the row's Actions column.
+Step 2: In the Evaluate Project Submission modal, review Section 01 (Core Information): verify project title accuracy (#approval-title) and comma-separated author names (#approval-authors).
+Step 3: Review Section 02 (Academic Classification): confirm Academic Program matches CTU campus departments (BSFi, BSIT, BSHM, BSIE, BSEd-Math, BEEd, BIT-Computer, BIT-Electronics, BIT-Automotive, BTLEd-HE), Academic Year (#approval-year), Faculty Adviser (#approval-adviser), and search Keywords (#approval-keywords).
+Step 4: Review Section 03 (Abstract & Summary) and Section 04 (Submitted Images): read the research abstract (#approval-abstract) and inspect the uploaded physical book representation photos in the preview grid (#approval-images-grid, default cover badge).
+Step 5: Click "Approve & Publish Publicly" (Emerald button #approval-confirm-btn) to immediately publish to the live repository and queue for Pinecone AI vector search sync, or click "Reject & Discard" (#approval-reject-btn) to dismiss with reason.
+Precaution: Approved projects are instantly published to the public catalog and queued for AI vector search sync. Locked projects cannot be evaluated until unlocked with the Lock button.`
   },
 
   // --- ADMIN ROLE SCOPE: PINECONE AI VECTOR SEARCH SYNC ---
@@ -241,13 +283,97 @@ Precaution: The staff member will be granted librarian cataloging privileges and
     role_scope: ['admin'],
     landmark: 'Settings Section > General Settings Card > "Maintenance Mode" Switch',
     text: `How Administrator Enables Maintenance Mode:
-Landmark: [Sidebar Rail > Settings] > [General Settings Card > "Maintenance Mode" Toggle].
+Landmark: [Area: Settings Section] > [Element: "Maintenance Mode" Switch (General Settings Card)].
 Step 1: Click "Settings" in the left sidebar rail.
 Step 2: In the General Settings box, find the "Maintenance Mode" switch.
 Step 3: Toggle the switch to ON.
 Step 4: Confirm activation in the dialog prompt.
 Effect: The public search portal and student login will be immediately locked and redirected to maintenance.html (showing scheduled completion date and trivia game). Logged-in Administrators retain full dashboard access to perform data work.
 To restore public access: Toggle the switch back to OFF.`
+  },
+
+  // --- ADMIN ROLE SCOPE: PROJECT EDIT & UPDATE ---
+  {
+    id: 'admin_edit_existing_project',
+    title: 'Editing and Updating an Existing Cataloged Thesis',
+    category: 'projects_cataloging',
+    role_scope: ['admin'],
+    landmark: 'Projects Table > Target Thesis Row > "Edit Record" (Pencil Icon #edit-project-btn)',
+    text: `How Administrator Edits an Existing Project in the Catalog:
+Landmark: [Area: Projects Section > All Projects Table] > [Element: "Edit Record" (Pencil Icon in Actions Column)].
+Step 1: Navigate to "Projects" in the left sidebar rail.
+Step 2: Locate the thesis in the table using the search box (#projects-search) or Program Filter Pills.
+Step 3: Click the gold Pencil icon (Edit) in the row's Actions column.
+Step 4: In the Edit Capstone Project modal, update title, author names, academic program, abstract, keywords, or physical shelf location note (Rack, Row, Stand, Color).
+Step 5: To replace or add physical book photos, drag new photos into Section 04 (Representation Photos).
+Step 6: Click "Update Capstone Project" (#save-project-btn). Changes will immediately update Firestore and queue Pinecone AI embeddings for automatic re-indexing.
+Precaution: Modifying title or abstract alters the vector embedding representation; verify data integrity before updating.`
+  },
+
+  // --- ADMIN ROLE SCOPE: USER ACCOUNT GOVERNANCE ---
+  {
+    id: 'admin_user_account_management',
+    title: 'Managing User Accounts, Unlocking Logins, and Password Resets',
+    category: 'user_management',
+    role_scope: ['admin'],
+    landmark: 'Users Section > Users Table > Actions Column',
+    text: `How Administrator Manages Student, Faculty, and Staff Accounts:
+Landmark: [Area: Users Section > Users Table] > [Element: Actions Column (Key Icon & Unlock Icon)].
+Step 1: Click "Users" in the left sidebar rail.
+Step 2: Use the Role Filter Pills (All Users, Students, Faculty, Librarians, Administrators) or search box (#users-search) to find the user by name or CTU email.
+Step 3: To reset a password: Click the Key icon in the user row. A temporary password modal will generate verified credentials.
+Step 4: To unlock a locked account: If a user exceeded failed login attempts, click the gold Unlock/Shield button to restore access immediately.
+Step 5: To adjust account privileges: Click the Edit icon to transition a user between Student, Faculty, or Librarian roles.
+Precaution: Administrator privileges cannot be downgraded from this table to prevent institutional lockout.`
+  },
+  {
+    id: 'admin_delete_user_account',
+    title: 'Deleting a User Account, Deletion Safety, and Lockout Protection',
+    category: 'user_management',
+    role_scope: ['admin'],
+    landmark: 'Users Section > Users Table > Actions Column (Red Trash Can Icon)',
+    text: `How Administrator Deletes a User Account:
+Landmark: [Area: Users Section > Users Table] > [Element: Actions Column (Red Trash Can Icon)].
+Step 1: Click "Users" in the left sidebar rail to open the Users management section (#section-users).
+Step 2: Use the Role Filter Pills (All Users, Students, Faculty, Librarians) or type the name or CTU email in the search box (#users-search) to locate the target user.
+Step 3: Hover over the user's row and locate the Actions column on the right.
+Step 4: Click the red Trash Can icon to trigger the account deletion modal.
+Step 5: Review the safety confirmation dialog: verify the user's email and confirm that they have no pending project proposals or evaluations.
+Step 6: Click "Delete" to permanently remove the account.
+Precaution: Deleted accounts are permanently purged from Firebase Authentication and Firestore records. User accounts cannot be restored once deleted. Administrator accounts cannot be deleted to prevent institutional lockout.`
+  },
+
+  // --- ADMIN ROLE SCOPE: AUDIT LOGS & TRACEABILITY ---
+  {
+    id: 'admin_system_audit_logs_analytics',
+    title: 'Viewing System Activity and Compliance Audit Logs',
+    category: 'system_audit',
+    role_scope: ['admin'],
+    landmark: 'Sidebar Rail > "Activity" (Clock Icon) OR Analytics Section',
+    text: `How Administrator Inspects Repository Audit Logs:
+Landmark: [Area: Sidebar Rail] > [Element: "Activity" (Clock Icon, #rail-nav-activity)].
+Step 1: Click "Activity" in the left sidebar rail to view the system audit trail.
+Step 2: Inspect chronological logs of all institutional actions: project uploads, evaluations, deletions, user logins, and Pinecone vector syncs.
+Step 3: Filter logs by action type or date range to audit librarian cataloging contributions or security events.
+Step 4: Click any entry to inspect actor email, timestamp, IP address, and changed fields.
+Precaution: System audit trails are immutable and permanent for CHED accreditation compliance.`
+  },
+
+  // --- ADMIN ROLE SCOPE: TROUBLESHOOTING AI SEARCH ---
+  {
+    id: 'admin_troubleshoot_rag_catalog',
+    title: 'Troubleshooting Why a Thesis is Missing from Search or RAG',
+    category: 'pinecone_sync',
+    role_scope: ['admin'],
+    landmark: 'Projects Section > Filter Pills > "🔴 Unsynced" Pill (#filter-unsynced)',
+    text: `How Administrator Troubleshoots Missing Theses in Search or Student AI Chat:
+Landmark: [Area: Projects Section > Filter Pills] > [Element: "🔴 Unsynced" Filter Pill (#filter-unsynced)].
+Step 1: Navigate to "Projects" in the left sidebar rail.
+Step 2: Check for Unsynced Status: Click the "🔴 Unsynced" filter pill above the table. If the project appears here, its vector embedding has not been indexed in Pinecone.
+Step 3: Check Approval Status: Go to "Approvals" in the sidebar rail. If the thesis was drafted by a librarian, it must be evaluated and approved before it enters the public index.
+Step 4: Trigger Pinecone Sync: In Projects, click the amber "Sync Pinecone" button (#sync-pinecone-btn) in the header action bar.
+Step 5: Verify Green Dot: Once sync finishes, verify that the green dot ( 🟢 ) appears beside the thesis title. The thesis is now fully searchable in both keyword and AI RAG modes.
+Precaution: The student AI chatbot and semantic RAG search only retrieve theses that have green synced status and "Published" catalog state.`
   }
 ];
 
