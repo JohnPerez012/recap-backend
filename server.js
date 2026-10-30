@@ -2385,7 +2385,7 @@ app.post('/api/users/create-librarian', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only administrators can create librarian accounts' });
     }
 
-    const { email, password, fullName } = req.body || {};
+    const { email, password, fullName, position } = req.body || {};
     const adminUid = callerUid;
 
     if (!email || !password || !fullName) {
@@ -2397,6 +2397,7 @@ app.post('/api/users/create-librarian', async (req, res) => {
 
     const trimmedEmail = email.trim().toLowerCase();
     const trimmedName = fullName.trim();
+    const trimmedPosition = (position || 'Librarian').trim();
 
     if (password.length < 6) {
       return res.status(400).json({
@@ -2449,6 +2450,7 @@ app.post('/api/users/create-librarian', async (req, res) => {
       await db.collection('users').doc(userRecord.uid).set({
         email: trimmedEmail,
         fullName: trimmedName,
+        position: trimmedPosition,
         userType: 'librarian',
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         createdBy: adminUid || 'admin',
@@ -2477,6 +2479,7 @@ app.post('/api/users/create-librarian', async (req, res) => {
         uid: userRecord.uid,
         email: trimmedEmail,
         fullName: trimmedName,
+        position: trimmedPosition,
         userType: 'librarian'
       }
     });
