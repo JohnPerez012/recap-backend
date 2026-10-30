@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "seed:admin": "node seed-admin.js"
+    "seed:admin": "node seed-admin.js",
+    "check": "node ../scripts/preflight.js",
+    "verify:routes": "node ../scripts/verify-routes.js",
+    "lint:fast": "npx oxlint server.js"
   },
   "keywords": [
     "pinecone",
