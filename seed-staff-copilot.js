@@ -415,7 +415,7 @@ async function runIngestion() {
 
     const embedResult = await embedResponse.json();
     const embeddings = embedResult.data;
-    console.log(`✓ Received ${embeddings.length} embeddings (${embeddings[0].values.length} dimensions each).\n`);
+    console.log(`Received ${embeddings.length} embeddings (${embeddings[0].values.length} dimensions each).\n`);
 
     // Step 2: Format vectors for upsert
     console.log('2️⃣ Preparing vector payloads with role-based metadata...');
@@ -452,7 +452,7 @@ async function runIngestion() {
     }
 
     const upsertResult = await upsertResponse.json();
-    console.log('✓ Pinecone Upsert Response:', upsertResult);
+    console.log('Pinecone Upsert Response:', upsertResult);
 
     console.log('\n====================================================');
     console.log('🎉 INGESTION COMPLETE! All staff knowledge is live in Pinecone.');

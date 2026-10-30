@@ -28,7 +28,7 @@ if (typeof fetch === 'undefined') {
 try {
   const { Agent, setGlobalDispatcher } = require('undici');
   setGlobalDispatcher(new Agent({ connect: { timeout: 30000 } }));
-  console.log('✓ Undici global dispatcher configured with 30s connect timeout');
+  console.log('Undici global dispatcher configured with 30s connect timeout');
 } catch (err) {
   console.warn('⚠️ Could not configure undici dispatcher:', err.message);
 }
@@ -57,7 +57,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   try {
     // Parse JSON directly from Render Environment Variable
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    console.log('✓ Using Firebase credentials from environment variable (Render)');
+    console.log('Using Firebase credentials from environment variable (Render)');
   } catch (error) {
     console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON environment variable:', error.message);
     process.exit(1);
@@ -77,7 +77,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
-console.log('✓ Firebase Admin initialized successfully');
+console.log('Firebase Admin initialized successfully');
 
 const db = admin.firestore();
 
@@ -91,8 +91,8 @@ const pinecone = new Pinecone({
 const indexName = 'recaps-projects-search';
 const index = pinecone.index(indexName, process.env.PINECONE_INDEX_HOST);
 
-console.log(`✓ Pinecone index: ${indexName}`);
-console.log('✓ Using Inference API (automatic embeddings)');
+console.log(`Pinecone index: ${indexName}`);
+console.log('Using Inference API (automatic embeddings)');
 
 // ============================================
 // RESEND EMAIL CONFIGURATION
@@ -103,7 +103,7 @@ const RESEND_FROM_NAME = process.env.RESEND_FROM_NAME ? process.env.RESEND_FROM_
 const FEEDBACK_RECIPIENT_EMAIL = process.env.FEEDBACK_RECIPIENT_EMAIL ? process.env.FEEDBACK_RECIPIENT_EMAIL.trim() : '';
 
 if (RESEND_API_KEY) {
-  console.log('✓ Resend API configured');
+  console.log('Resend API configured');
   console.log(`  From: ${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>`);
   if (FEEDBACK_RECIPIENT_EMAIL) {
     console.log(`  Admin Recipient: ${FEEDBACK_RECIPIENT_EMAIL}`);
@@ -124,7 +124,7 @@ try {
       api_key: process.env.CLOUDINARY_API_KEY,
       api_secret: process.env.CLOUDINARY_API_SECRET
     });
-    console.log('✓ Cloudinary configured');
+    console.log('Cloudinary configured');
   } else if (!cloudinary) {
     console.warn('⚠️  Cloudinary package not available. Image deletion disabled.');
   } else {
@@ -322,7 +322,7 @@ async function callAIProvider(providerKey, messages, maxTokens = 1000) {
     const data = await response.json();
     const content = provider.extractResponse(data);
     
-    console.log(`✓ ${provider.name} responded successfully`);
+    console.log(`${provider.name} responded successfully`);
     return content;
     
   } catch (error) {
@@ -386,7 +386,7 @@ async function streamFromAIProvider(providerKey, messages, maxTokens = 1000, onT
     }
   }
 
-  console.log(`✓ ${provider.name} stream completed (${tokenCount} chunks, ${fullText.length} chars)`);
+  console.log(`${provider.name} stream completed (${tokenCount} chunks, ${fullText.length} chars)`);
   return fullText;
 }
 
@@ -723,7 +723,7 @@ async function upsertProjectToPinecone(projectId, projectData) {
           throw new Error(`Pinecone upsert failed: ${errorText}`);
         }
 
-        console.log(`✓ Project upserted to Pinecone: ${projectId}`);
+        console.log(`Project upserted to Pinecone: ${projectId}`);
         return true;
       } catch (err) {
         if (timeoutId) clearTimeout(timeoutId);
@@ -768,7 +768,7 @@ async function deleteProjectFromPinecone(projectId) {
       throw new Error(`Pinecone delete failed: ${errorText}`);
     }
     
-    console.log(`✓ Project deleted from Pinecone: ${projectId}`);
+    console.log(`Project deleted from Pinecone: ${projectId}`);
     return true;
   } catch (error) {
     console.error(`❌ Failed to delete project from Pinecone:`, error);
@@ -897,7 +897,7 @@ app.get('/api/projects/sync-status', async (req, res) => {
             pineconeSynced: true,
             pineconeSyncedAt: admin.firestore.FieldValue.serverTimestamp()
           });
-          console.log(`✓ Reconciled Firestore doc ${id} to pineconeSynced: true`);
+          console.log(`Reconciled Firestore doc ${id} to pineconeSynced: true`);
         }
       } catch (err) {}
     }
@@ -998,7 +998,7 @@ app.post('/api/projects/sync-all', async (req, res) => {
       }
     }
     
-    console.log(`✓ Sync complete: ${results.success} success, ${results.failed} failed`);
+    console.log(`Sync complete: ${results.success} success, ${results.failed} failed`);
     
     res.json({
       success: true,
@@ -1093,7 +1093,7 @@ app.post('/api/pinecone/search', async (req, res) => {
     const embedData = await embedResponse.json();
     const queryVector = embedData.data[0].values;
     
-    console.log(`✓ Generated embedding (${queryVector.length} dimensions)`);
+    console.log(`Generated embedding (${queryVector.length} dimensions)`);
     
     // Step 2: Query Pinecone with the generated vector
     const queryUrl = `https://${process.env.PINECONE_INDEX_HOST}/query`;
@@ -1120,7 +1120,7 @@ app.post('/api/pinecone/search', async (req, res) => {
     
     const results = await response.json();
     
-    console.log(`✓ Found ${results.matches?.length || 0} results for: "${query}"`);
+    console.log(`Found ${results.matches?.length || 0} results for: "${query}"`);
     
     // Transform results for frontend
     const matches = results.matches.map(match => ({
@@ -1469,7 +1469,7 @@ app.post('/api/staff-copilot/chat', async (req, res) => {
             landmark: m.metadata?.landmark || '',
             text: m.metadata?.text || ''
           }));
-          console.log(`✓ Retrieved ${retrievedChunks.length} RAG guidance chunks from Pinecone (top score: ${retrievedChunks[0]?.score?.toFixed(3) || 0})`);
+          console.log(`Retrieved ${retrievedChunks.length} RAG guidance chunks from Pinecone (top score: ${retrievedChunks[0]?.score?.toFixed(3) || 0})`);
         } else {
           console.warn('⚠️ Pinecone staff copilot query failed:', await pineconeRes.text());
         }
@@ -1602,7 +1602,7 @@ app.delete('/api/cloudinary/delete', async (req, res) => {
     const result = await cloudinary.uploader.destroy(publicId);
 
     if (result.result === 'ok') {
-      console.log(`✓ Image deleted successfully: ${publicId}`);
+      console.log(`Image deleted successfully: ${publicId}`);
       return res.json({
         success: true,
         message: 'Image deleted successfully',
@@ -1658,7 +1658,7 @@ async function handleUserDeletion(uid, email, res) {
       await admin.auth().deleteUser(targetUid);
       authDeleted = true;
       authMessage = `Deleted user ${targetUid} from Firebase Authentication`;
-      console.log(`✓ ${authMessage}`);
+      console.log(`${authMessage}`);
     } catch (authError) {
       if (authError.code === 'auth/user-not-found') {
         console.log(`ℹ️ User UID ${targetUid} not found in Firebase Authentication (already deleted)`);
@@ -1678,7 +1678,7 @@ async function handleUserDeletion(uid, email, res) {
       await admin.auth().deleteUser(userRecord.uid);
       authDeleted = true;
       authMessage = `Deleted user ${userRecord.uid} (${email}) from Firebase Authentication via email lookup`;
-      console.log(`✓ ${authMessage}`);
+      console.log(`${authMessage}`);
     } catch (emailError) {
       if (emailError.code === 'auth/user-not-found') {
         console.log(`ℹ️ User with email ${email} not found in Firebase Authentication`);
@@ -1700,7 +1700,7 @@ async function handleUserDeletion(uid, email, res) {
       if (doc.exists) {
         await userDocRef.delete();
         firestoreDeleted = true;
-        console.log(`✓ Deleted Firestore document for user ${targetUid}`);
+        console.log(`Deleted Firestore document for user ${targetUid}`);
       } else {
         firestoreDeleted = true;
         console.log(`ℹ️ Firestore document for user ${targetUid} already absent`);
@@ -1805,7 +1805,7 @@ app.post('/api/users/create-librarian', async (req, res) => {
         password: password,
         displayName: trimmedName
       });
-      console.log(`✓ Created Firebase Auth user: ${userRecord.uid} (${trimmedEmail})`);
+      console.log(`Created Firebase Auth user: ${userRecord.uid} (${trimmedEmail})`);
     } catch (authErr) {
       console.error('❌ Firebase Auth createUser error:', authErr);
       if (authErr.code === 'auth/email-already-exists') {
@@ -1847,7 +1847,7 @@ app.post('/api/users/create-librarian', async (req, res) => {
         lastLogin: null,
         photoURL: null
       });
-      console.log(`✓ Created Firestore profile for librarian: ${userRecord.uid}`);
+      console.log(`Created Firestore profile for librarian: ${userRecord.uid}`);
     } catch (fsErr) {
       console.error('❌ Firestore write error for new librarian:', fsErr);
       // Clean up auth user if firestore write failed
@@ -1915,14 +1915,14 @@ app.listen(PORT, () => {
   console.log(`\n${'='.repeat(50)}`);
   console.log(`🚀 RECAP Backend Server`);
   console.log(`${'='.repeat(50)}`);
-  console.log(`✓ Server running on port ${PORT}`);
-  console.log(`✓ Firebase: Connected`);
-  console.log(`✓ Pinecone: Connected (${indexName})`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Firebase: Connected`);
+  console.log(`Pinecone: Connected (${indexName})`);
   console.log(`\n📡 AI Providers (Priority Order):`);
-  console.log(`    1. ${AI_PROVIDERS.mistral.name} ${AI_PROVIDERS.mistral.apiKey ? '✓' : '✗'}`);
-  console.log(`    2. ${AI_PROVIDERS.groq.name} ${AI_PROVIDERS.groq.apiKey ? '✓' : '✗'}`);
-  console.log(`    3. ${AI_PROVIDERS.gemini.name} ${AI_PROVIDERS.gemini.apiKey ? '✓' : '✗'}`);
-  console.log(`    4. ${AI_PROVIDERS.openrouter.name} ${AI_PROVIDERS.openrouter.apiKey ? '✓' : '✗'}`);
+  console.log(`    1. ${AI_PROVIDERS.mistral.name} ${AI_PROVIDERS.mistral.apiKey ? '' : '✗'}`);
+  console.log(`    2. ${AI_PROVIDERS.groq.name} ${AI_PROVIDERS.groq.apiKey ? '' : '✗'}`);
+  console.log(`    3. ${AI_PROVIDERS.gemini.name} ${AI_PROVIDERS.gemini.apiKey ? '' : '✗'}`);
+  console.log(`    4. ${AI_PROVIDERS.openrouter.name} ${AI_PROVIDERS.openrouter.apiKey ? '' : '✗'}`);
   console.log(`\n🌐 Endpoints:`);
   console.log(`    POST   /api/pinecone/search - RAG semantic search`);
   console.log(`    POST   /api/chat - AI chat with fallback`);
@@ -1988,7 +1988,7 @@ app.post('/api/feedback', async (req, res) => {
         ipAddress: req.ip || 'unknown',
         userAgent: req.headers['user-agent'] || 'unknown'
       });
-      console.log('✓ Feedback stored in Firestore');
+      console.log('Feedback stored in Firestore');
     } catch (dbError) {
       console.warn('⚠️ Failed to store in Firestore:', dbError.message);
     }
@@ -2215,7 +2215,7 @@ app.post('/api/feedback', async (req, res) => {
           const errorData = await adminEmailResponse.json().catch(() => ({}));
           console.warn('⚠️ Admin email failed:', errorData.message || adminEmailResponse.statusText);
         } else {
-          console.log('✓ Feedback admin email sent successfully to', recipientEmail);
+          console.log('Feedback admin email sent successfully to', recipientEmail);
         }
       } catch (emailError) {
         console.warn('⚠️ Failed to send admin email:', emailError.message);
@@ -2358,7 +2358,7 @@ app.post('/api/feedback', async (req, res) => {
               
               <div class="info-box">
                 <div class="info-item">
-                  <span class="info-icon">✓</span>
+                  <span class="info-icon"></span>
                   <span>Your message has been sent to our team</span>
                 </div>
                 <div class="info-item">
@@ -2406,7 +2406,7 @@ app.post('/api/feedback', async (req, res) => {
         const errorData = await userEmailResponse.json();
         console.warn('⚠️ User confirmation email failed:', errorData.message);
       } else {
-        console.log('✓ Confirmation email sent to', email);
+        console.log('Confirmation email sent to', email);
       }
     } catch (confirmError) {
       console.warn('⚠️ Failed to send confirmation email:', confirmError.message);

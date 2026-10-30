@@ -20,6 +20,7 @@ test-*.js
 test-*.bat
 test-*.sh
 test-*.ps1
+feedback-endpoint-resend.js
 scratch/
 tmp/
 temp/
