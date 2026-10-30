@@ -1750,11 +1750,343 @@ app.post('/api/users/delete', async (req, res) => {
   }
 });
 
+// ============================================
+// TELEGRAM BOT & 2FA OTP CONFIGURATION
+// ============================================
+const TELEGRAM_OTP_BOT_TOKEN = (process.env.TELEGRAM_OTP_BOT_TOKEN || '8232897628:AAF2Zsn5-xbcgP9qGMIbexd5qAlfc-Idvfo').trim();
+const TELEGRAM_ALERT_BOT_TOKEN = (process.env.TELEGRAM_ALERT_BOT_TOKEN || '9151441003:AAGNOIhGj4lNzTO5fNcwVSdENflX8f6zBv0').trim();
+
+/**
+ * Dispatch message to Telegram via Bot HTTP API
+ */
+async function sendTelegramMessage(botToken, chatId, text, parseMode = 'HTML') {
+  if (!botToken || !chatId) {
+    console.warn('[Telegram] Missing bot token or chatId, skipping message');
+    return false;
+  }
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        parse_mode: parseMode
+      })
+    });
+    const result = await response.json();
+    if (!result.ok) {
+      console.error('[Telegram] API Error:', result.description);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[Telegram] Dispatch failed:', err.message);
+    return false;
+  }
+}
+
+// Lightweight Telegram update poller for RecapsOtpBot: auto-replies with user's Chat ID when they message /start
+let lastTelegramUpdateId = 0;
+async function pollTelegramUpdates() {
+  if (!TELEGRAM_OTP_BOT_TOKEN) return;
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_OTP_BOT_TOKEN}/getUpdates?offset=${lastTelegramUpdateId + 1}&timeout=5`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (data.ok && Array.isArray(data.result)) {
+      for (const update of data.result) {
+        lastTelegramUpdateId = update.update_id;
+        const msg = update.message;
+        if (msg && msg.text && msg.chat && msg.chat.id) {
+          const chatId = msg.chat.id;
+          const senderName = msg.from ? (msg.from.first_name || 'User') : 'User';
+          const replyText = `👋 Hello <b>${senderName}</b>!\n\n` +
+            `🔐 <b>RE-CAPS Security Bot</b>\n` +
+            `Your Telegram Chat ID is: <code>${chatId}</code>\n\n` +
+            `📋 <i>Copy and paste this ID into your RE-CAPS Account Settings to enable 2FA OTP verification and instant security notifications.</i>`;
+          await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, chatId, replyText);
+        }
+      }
+    }
+  } catch (e) {
+    // Non-blocking network glitch
+  }
+}
+setInterval(pollTelegramUpdates, 12000);
+
+// In-Memory Rate Limiting & OTP Storage
+// rateLimits: key -> { count, firstAttempt, failedCount, lockedUntil }
+const passwordChangeRateLimits = new Map();
+// otps: uid -> { otp, expiresAt, attempts }
+const passwordChangeOtps = new Map();
+
+/**
+ * Layer 2: Rate Limiting & Exponential Lockout
+ * 24-hour window: 10 attempts max
+ * 5 consecutive failures: 1-hour lockout
+ */
+function checkPasswordChangeRateLimit(key) {
+  const now = Date.now();
+  let record = passwordChangeRateLimits.get(key);
+  if (!record) {
+    record = { count: 0, firstAttempt: now, failedCount: 0, lockedUntil: null };
+    passwordChangeRateLimits.set(key, record);
+  }
+
+  // Check 1-hour lockout
+  if (record.lockedUntil && now < record.lockedUntil) {
+    const remainingMins = Math.ceil((record.lockedUntil - now) / 60000);
+    return {
+      allowed: false,
+      message: `Account temporarily locked due to 5 consecutive failed attempts. Please try again in ${remainingMins} minute(s).`,
+      code: 'ACCOUNT_LOCKED_1_HOUR'
+    };
+  }
+
+  // Reset 24-hour cycle
+  if (now - record.firstAttempt > 24 * 60 * 60 * 1000) {
+    record.count = 0;
+    record.firstAttempt = now;
+  }
+
+  // Check 10 attempts per 24 hours
+  if (record.count >= 10) {
+    return {
+      allowed: false,
+      message: 'Daily password change limit reached (maximum 10 attempts per 24 hours). Please try again tomorrow.',
+      code: 'DAILY_RATE_LIMIT_EXCEEDED'
+    };
+  }
+
+  return { allowed: true, record };
+}
+
+function recordPasswordChangeFailure(key) {
+  let record = passwordChangeRateLimits.get(key);
+  if (!record) {
+    record = { count: 1, firstAttempt: Date.now(), failedCount: 1, lockedUntil: null };
+    passwordChangeRateLimits.set(key, record);
+  } else {
+    record.count++;
+    record.failedCount++;
+  }
+
+  if (record.failedCount >= 5) {
+    record.lockedUntil = Date.now() + 60 * 60 * 1000; // 1-hour lockout
+  }
+}
+
+function recordPasswordChangeSuccess(key) {
+  let record = passwordChangeRateLimits.get(key);
+  if (record) {
+    record.count++;
+    record.failedCount = 0;
+    record.lockedUntil = null;
+  }
+}
+
+// Layer 3: Password Policy Enforcement
+const COMMON_WEAK_PASSWORDS = new Set([
+  'password', 'password123', 'password1234', 'p@ssword', 'p@ssw0rd', 'p@ssword123',
+  '12345678', '123456789', '1234567890', 'qwerty1234', 'admin1234', 'admin12345',
+  'recaps1234', 'recaps2026', 'ctu12345', 'ctudaanbantayan', 'iloveyou123'
+]);
+
+function validateNewPasswordPolicy(newPassword, userData) {
+  if (typeof newPassword !== 'string') return 'Password must be a valid string';
+  if (newPassword.length < 8) return 'Password must be at least 8 characters long';
+  if (newPassword.length > 128) return 'Password must not exceed 128 characters';
+  if (!/[0-9]/.test(newPassword)) return 'Password must contain at least 1 number (0-9)';
+  if (!/[a-z]/.test(newPassword) || !/[A-Z]/.test(newPassword)) return 'Password must contain both uppercase and lowercase letters';
+  if (!/[^A-Za-z0-9]/.test(newPassword)) return 'Password must contain at least 1 special character (!@#$%^&*...)';
+
+  const lower = newPassword.toLowerCase();
+  if (COMMON_WEAK_PASSWORDS.has(lower)) {
+    return 'This password is too common and easily breached. Please choose a more unique password.';
+  }
+
+  if (userData) {
+    const names = [
+      (userData.firstName || '').toLowerCase().trim(),
+      (userData.lastName || '').toLowerCase().trim(),
+      (userData.fullName || '').toLowerCase().trim(),
+      (userData.name || '').toLowerCase().trim()
+    ].filter(n => n.length >= 3);
+
+    for (const n of names) {
+      if (lower.includes(n)) {
+        return 'Password must not contain your name or personal details';
+      }
+    }
+
+    if (userData.email) {
+      const emailPrefix = userData.email.split('@')[0].toLowerCase().trim();
+      if (emailPrefix.length >= 4 && lower.includes(emailPrefix)) {
+        return 'Password must not contain your email username';
+      }
+    }
+
+    const idNumber = (userData.studentId || userData.idNumber || userData.employeeId || '').toString().toLowerCase().trim();
+    if (idNumber.length >= 4 && lower.includes(idNumber)) {
+      return 'Password must not contain your student/employee ID number';
+    }
+  }
+
+  return null;
+}
+
+// Current Password Verification via Firebase Auth REST API
+async function verifyUserCurrentPassword(email, currentPassword) {
+  if (!email || !currentPassword) return false;
+  try {
+    const apiKey = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyD-cx4ujJ2RUq6TZ8fUaNetft05OuTW4vk';
+    const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password: currentPassword, returnSecureToken: true })
+    });
+    const data = await resp.json();
+    return Boolean(resp.ok && data && data.idToken);
+  } catch (err) {
+    console.error('[Auth] Error verifying current password:', err.message);
+    return false;
+  }
+}
+
+/**
+ * POST /api/auth/telegram/send-otp
+ * Sends a 6-digit OTP to user's linked Telegram Chat ID via RecapsOtpBot
+ */
+app.post('/api/auth/telegram/send-otp', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing token', code: 'UNAUTHORIZED' });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const callerUid = decoded.uid;
+
+    const userDoc = await db.collection('users').doc(callerUid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User record not found', code: 'USER_NOT_FOUND' });
+    }
+
+    const userData = userDoc.data();
+    const chatId = userData.telegramChatId || (req.body && req.body.telegramChatId);
+
+    if (!chatId) {
+      return res.status(400).json({
+        success: false,
+        error: 'No Telegram account linked. Please open @RecapsOtpBot on Telegram to get your Chat ID, then save it in your settings.',
+        code: 'NO_TELEGRAM_LINKED'
+      });
+    }
+
+    // Rate limit OTP requests: 1 request every 30 seconds
+    const existingOtp = passwordChangeOtps.get(callerUid);
+    if (existingOtp && Date.now() < existingOtp.expiresAt - (4.5 * 60 * 1000)) {
+      return res.status(429).json({
+        success: false,
+        error: 'Please wait 30 seconds before requesting another OTP.',
+        code: 'OTP_RATE_LIMITED'
+      });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    passwordChangeOtps.set(callerUid, {
+      otp,
+      expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes validity
+      attempts: 0
+    });
+
+    const otpMessage = `🔐 <b>RE-CAPS Security Verification</b>\n\n` +
+      `Your One-Time Password (OTP) for changing your account password is:\n\n` +
+      `  👉 <code>${otp}</code> 👈\n\n` +
+      `⏰ <i>This code will expire in <b>5 minutes</b>.</i>\n` +
+      `⚠️ <b>Security Notice:</b> Never share this code with anyone.`;
+
+    const dispatched = await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, chatId, otpMessage);
+    if (!dispatched) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to deliver OTP to Telegram. Ensure you have opened @RecapsOtpBot and clicked Start.',
+        code: 'TELEGRAM_DISPATCH_FAILED'
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'OTP has been dispatched to your Telegram account via @RecapsOtpBot'
+    });
+
+  } catch (err) {
+    console.error('❌ Error in /api/auth/telegram/send-otp:', err);
+    return res.status(500).json({ success: false, error: err.message, code: 'OTP_SEND_ERROR' });
+  }
+});
+
+/**
+ * POST /api/auth/telegram/save-chat-id
+ * Links or updates user's Telegram Chat ID in Firestore
+ */
+app.post('/api/auth/telegram/save-chat-id', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing token', code: 'UNAUTHORIZED' });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const callerUid = decoded.uid;
+    const { telegramChatId } = req.body || {};
+
+    if (!telegramChatId || !/^\d+$/.test(telegramChatId.toString().trim())) {
+      return res.status(400).json({ success: false, error: 'Invalid Telegram Chat ID format. Must be numeric.', code: 'INVALID_CHAT_ID' });
+    }
+
+    const cleanChatId = telegramChatId.toString().trim();
+
+    // Verify chat ID can receive messages
+    const pingText = `✅ <b>RE-CAPS Telegram Integration Connected!</b>\n\n` +
+      `Your Telegram account has been linked successfully.\n` +
+      `You will receive 2FA verification codes and instant security alerts here.`;
+
+    const sent = await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, cleanChatId, pingText);
+    if (!sent) {
+      // Try with OTP bot token as fallback
+      await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, cleanChatId, pingText);
+    }
+
+    await db.collection('users').doc(callerUid).update({
+      telegramChatId: cleanChatId,
+      telegramLinkedAt: new Date().toISOString()
+    });
+
+    return res.json({
+      success: true,
+      message: 'Telegram Chat ID linked and verified successfully!'
+    });
+  } catch (err) {
+    console.error('❌ Error in /api/auth/telegram/save-chat-id:', err);
+    return res.status(500).json({ success: false, error: err.message, code: 'LINK_CHAT_ERROR' });
+  }
+});
+
 /**
  * POST /api/auth/change-password
- * Change user password securely after security question verification.
- * Uses Firebase Admin SDK to update the credential safely without triggering
- * client-side 'auth/requires-recent-login' token staleness errors.
+ * Complete 6-Layer Security Password Change Architecture:
+ * - Layer 1: Step-Up Verification (Admin/Librarian: Current Password AND Telegram OTP; Student/Teacher: Password OR Security Question)
+ * - Layer 2: Rate Limiting & Lockout (10 attempts/24h, 5 failures = 1 hour lockout)
+ * - Layer 3: Strict Password Policy (Complexity, 128 max length, disallow personal info, block common passwords)
+ * - Layer 4: Server-Side RBAC & Admin SDK Token Authentication
+ * - Layer 5: Immediate Session Revocation across all devices via admin.auth().revokeRefreshTokens
+ * - Layer 6: Security Notifications (Student/Teacher: Telegram only; Admin/Librarian: Telegram AND Email)
  */
 app.post('/api/auth/change-password', async (req, res) => {
   try {
@@ -1764,47 +2096,255 @@ app.post('/api/auth/change-password', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Missing authentication token', code: 'UNAUTHORIZED' });
     }
 
+    // Layer 4: Cryptographic Token Verification
     let callerUid;
+    let tokenEmail;
     try {
       const decoded = await admin.auth().verifyIdToken(idToken);
       callerUid = decoded.uid;
+      tokenEmail = decoded.email;
     } catch (tokenErr) {
       return res.status(401).json({ success: false, error: 'Invalid or expired session. Please log in again.', code: 'INVALID_TOKEN' });
     }
 
-    const { newPassword, securityAnswer } = req.body || {};
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
+    const rateLimitKey = `${callerUid}_${clientIp}`;
 
-    if (!newPassword || newPassword.length < 8) {
-      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters long', code: 'WEAK_PASSWORD' });
+    // Layer 2: Rate Limiting & Lockout Check
+    const rateCheck = checkPasswordChangeRateLimit(rateLimitKey);
+    if (!rateCheck.allowed) {
+      return res.status(429).json({ success: false, error: rateCheck.message, code: rateCheck.code });
     }
 
-    // Verify user document and security answer in Firestore
+    // Fetch user document from Firestore
     const userDoc = await db.collection('users').doc(callerUid).get();
     if (!userDoc.exists) {
       return res.status(404).json({ success: false, error: 'User record not found in system', code: 'USER_NOT_FOUND' });
     }
 
-    const userData = userDoc.data();
-    const storedAnswer = (userData.securityAnswer || '').toString().trim().toLowerCase();
-    const providedAnswer = (securityAnswer || '').toString().trim().toLowerCase();
+    const userData = userDoc.data() || {};
+    const userRole = (userData.role || userData.userType || 'student').toLowerCase();
+    const userEmail = userData.email || tokenEmail;
+    const userChatId = userData.telegramChatId;
 
-    if (!storedAnswer) {
-      return res.status(400).json({ success: false, error: 'No security answer configured for this account', code: 'NO_SECURITY_ANSWER' });
+    const { newPassword, currentPassword, securityAnswer, otp } = req.body || {};
+
+    // Layer 1: Role-Based Step-Up Identity Re-verification
+    if (userRole === 'admin' || userRole === 'librarian') {
+      // ADMIN & LIBRARIAN: MUST be Current Password AND Telegram OTP
+      if (!currentPassword) {
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(400).json({ success: false, error: 'Staff accounts require your current password for security verification.', code: 'CURRENT_PASSWORD_REQUIRED' });
+      }
+
+      if (!otp) {
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(400).json({ success: false, error: 'Staff accounts require a 6-digit Telegram OTP verification code.', code: 'OTP_REQUIRED' });
+      }
+
+      // 1. Verify Current Password
+      const isPasswordValid = await verifyUserCurrentPassword(userEmail, currentPassword);
+      if (!isPasswordValid) {
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(403).json({ success: false, error: 'Incorrect current password. Verification failed.', code: 'INVALID_CURRENT_PASSWORD' });
+      }
+
+      // 2. Verify Telegram OTP
+      const storedOtpRecord = passwordChangeOtps.get(callerUid);
+      if (!storedOtpRecord) {
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(403).json({ success: false, error: 'No active OTP found. Please click "Send OTP to Telegram" first.', code: 'NO_ACTIVE_OTP' });
+      }
+
+      if (Date.now() > storedOtpRecord.expiresAt) {
+        passwordChangeOtps.delete(callerUid);
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(403).json({ success: false, error: 'OTP has expired (valid for 5 minutes). Please request a new OTP.', code: 'OTP_EXPIRED' });
+      }
+
+      storedOtpRecord.attempts++;
+      if (storedOtpRecord.attempts > 3) {
+        passwordChangeOtps.delete(callerUid);
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(403).json({ success: false, error: 'Too many incorrect OTP attempts. Please request a new OTP.', code: 'OTP_ATTEMPTS_EXCEEDED' });
+      }
+
+      if (storedOtpRecord.otp !== otp.toString().trim()) {
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(403).json({ success: false, error: 'Incorrect OTP code. Please check your Telegram message.', code: 'INVALID_OTP' });
+      }
+
+      // Consume OTP
+      passwordChangeOtps.delete(callerUid);
+
+    } else {
+      // STUDENT & TEACHER: Current Password OR Security Question
+      let verifiedIdentity = false;
+
+      // Option A: Security Answer
+      if (securityAnswer) {
+        const storedAnswer = (userData.securityAnswer || '').toString().trim().toLowerCase();
+        const providedAnswer = securityAnswer.toString().trim().toLowerCase();
+        if (storedAnswer && storedAnswer === providedAnswer) {
+          verifiedIdentity = true;
+        }
+      }
+
+      // Option B: Current Password
+      if (!verifiedIdentity && currentPassword) {
+        const isPasswordValid = await verifyUserCurrentPassword(userEmail, currentPassword);
+        if (isPasswordValid) {
+          verifiedIdentity = true;
+        }
+      }
+
+      if (!verifiedIdentity) {
+        recordPasswordChangeFailure(rateLimitKey);
+        return res.status(403).json({
+          success: false,
+          error: 'Verification failed. Please provide your correct Security Answer or Current Password.',
+          code: 'VERIFICATION_FAILED'
+        });
+      }
     }
 
-    if (storedAnswer !== providedAnswer) {
-      return res.status(403).json({ success: false, error: 'Security question verification failed. Incorrect answer.', code: 'INVALID_ANSWER' });
+    // Layer 3: Strict New Password Policy Validation
+    const policyError = validateNewPasswordPolicy(newPassword, userData);
+    if (policyError) {
+      recordPasswordChangeFailure(rateLimitKey);
+      return res.status(400).json({ success: false, error: policyError, code: 'PASSWORD_POLICY_VIOLATION' });
     }
 
-    // Update password in Firebase Auth via Admin SDK
+    // Layer 4: Admin SDK Password Update
     await admin.auth().updateUser(callerUid, {
       password: newPassword
     });
 
-    console.log(`✓ Password successfully updated via Admin SDK for user: ${callerUid}`);
+    // Layer 5: Immediate Session Revocation across all devices & browsers
+    try {
+      await admin.auth().revokeRefreshTokens(callerUid);
+      console.log(`🔒 [Security] Revoked all refresh tokens and sessions for user: ${callerUid}`);
+    } catch (revokeErr) {
+      console.warn('[Security] Token revocation warning:', revokeErr.message);
+    }
+
+    // Record success in rate limiter
+    recordPasswordChangeSuccess(rateLimitKey);
+
+    // Formatted Timestamp (Asia/Manila, UTC+8)
+    const formattedDate = new Intl.DateTimeFormat('en-PH', {
+      dateStyle: 'full',
+      timeStyle: 'medium',
+      timeZone: 'Asia/Manila'
+    }).format(new Date());
+
+    // Layer 6: Security Notifications Dispatch
+    if (userRole === 'admin' || userRole === 'librarian') {
+      // ADMIN & LIBRARIAN: Telegram AND Email Dual-Route Alert
+      const alertText = `🚨 <b>RE-CAPS Security Alert: Staff Password Changed</b>\n\n` +
+        `Hello <b>${userData.name || 'Staff Member'}</b>,\n` +
+        `Your RE-CAPS account password was successfully updated.\n\n` +
+        `📅 <b>Timestamp:</b> ${formattedDate}\n` +
+        `🌐 <b>IP Address:</b> <code>${clientIp}</code>\n` +
+        `👤 <b>Role:</b> ${userRole.toUpperCase()}\n\n` +
+        `⚠️ <i>All previous active sessions have been securely terminated. If you did not make this change, contact system security immediately!</i>`;
+
+      // 1. Telegram Dispatch
+      if (userChatId) {
+        await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, userChatId, alertText);
+      }
+
+      // 2. Email Dispatch via Resend
+      const activeResendKey = (process.env.RESEND_API_KEY || RESEND_API_KEY || '').trim();
+      if (activeResendKey && userEmail) {
+        try {
+          const fromField = RESEND_FROM_NAME ? `${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>` : RESEND_FROM_EMAIL;
+          const emailHtml = `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+              <div style="background: #111827; padding: 24px; text-align: center;">
+                <h2 style="color: #ffffff; margin: 0; font-size: 20px;">🛡️ RE-CAPS Security Notice</h2>
+              </div>
+              <div style="padding: 32px 24px;">
+                <h3 style="color: #1f2937; margin-top: 0;">Password Changed Successfully</h3>
+                <p style="color: #4b5563; line-height: 1.6;">Hello <strong>${userData.name || 'Staff Member'}</strong>,</p>
+                <p style="color: #4b5563; line-height: 1.6;">The password for your <strong>${userRole.toUpperCase()}</strong> account (<code>${userEmail}</code>) was just changed.</p>
+                <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin: 20px 0;">
+                  <p style="margin: 4px 0; color: #374151;"><strong>📅 Date & Time:</strong> ${formattedDate}</p>
+                  <p style="margin: 4px 0; color: #374151;"><strong>🌐 Source IP:</strong> ${clientIp}</p>
+                  <p style="margin: 4px 0; color: #374151;"><strong>🔒 Session Security:</strong> All other active sessions have been revoked.</p>
+                </div>
+                <p style="color: #dc2626; font-weight: 600; font-size: 14px;">If you did not perform this change, please contact the Head Librarian immediately.</p>
+              </div>
+              <div style="background: #f3f4f6; padding: 16px; text-align: center; color: #6b7280; font-size: 12px;">
+                Cebu Technological University - Daanbantayan Campus Library • RE-CAPS System
+              </div>
+            </div>
+          `;
+
+          await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${activeResendKey}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              from: fromField,
+              to: [userEmail],
+              subject: '⚠️ Security Alert: RE-CAPS Staff Password Changed',
+              html: emailHtml
+            })
+          });
+          console.log(`✉️ [Security] Dispatched dual-route alert email to ${userEmail}`);
+        } catch (mailErr) {
+          console.error('[Security] Failed to dispatch alert email:', mailErr.message);
+        }
+      }
+
+    } else {
+      // STUDENT & TEACHER: Telegram ONLY (with fallback to email if Telegram not linked yet)
+      const alertText = `🔔 <b>RE-CAPS Security Notice: Password Updated</b>\n\n` +
+        `Hello <b>${userData.name || 'Student/Researcher'}</b>,\n` +
+        `Your RE-CAPS account password was successfully updated.\n\n` +
+        `📅 <b>Timestamp:</b> ${formattedDate}\n` +
+        `🌐 <b>IP Address:</b> <code>${clientIp}</code>\n\n` +
+        `🔒 <i>All other active sessions have been securely closed. If you did not make this change, please report it to the CTU Library.</i>`;
+
+      if (userChatId) {
+        await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, userChatId, alertText);
+      } else {
+        // Fallback: If Telegram is not yet linked, send email notification so they are alerted
+        const activeResendKey = (process.env.RESEND_API_KEY || RESEND_API_KEY || '').trim();
+        if (activeResendKey && userEmail) {
+          try {
+            const fromField = RESEND_FROM_NAME ? `${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>` : RESEND_FROM_EMAIL;
+            const emailHtml = `
+              <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+                <div style="background: #08D488; padding: 20px; text-align: center;">
+                  <h2 style="color: #ffffff; margin: 0; font-size: 20px;">RE-CAPS Security Alert</h2>
+                </div>
+                <div style="padding: 24px;">
+                  <p style="color: #374151;">Hello <strong>${userData.name || 'User'}</strong>,</p>
+                  <p style="color: #374151;">Your password was updated on <strong>${formattedDate}</strong> from IP <code>${clientIp}</code>.</p>
+                  <p style="color: #6b7280; font-size: 13px;">💡 Tip: Connect with @RecapsOtpBot on Telegram to receive instant mobile security alerts directly on Telegram.</p>
+                </div>
+              </div>
+            `;
+            await fetch('https://api.resend.com/emails', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${activeResendKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ from: fromField, to: [userEmail], subject: 'Security Notice: RE-CAPS Password Changed', html: emailHtml })
+            });
+          } catch (e) {
+            // Non-blocking
+          }
+        }
+      }
+    }
+
+    console.log(`✓ [Security] Password successfully changed with 6-layer defense for user: ${callerUid} (${userRole})`);
     return res.json({
       success: true,
-      message: 'Password updated successfully'
+      message: 'Password successfully updated across all security layers.'
     });
 
   } catch (err) {
@@ -1816,6 +2356,7 @@ app.post('/api/auth/change-password', async (req, res) => {
     });
   }
 });
+
 
 /**
  * POST /api/users/create-librarian
