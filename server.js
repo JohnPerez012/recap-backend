@@ -1751,6 +1751,73 @@ app.post('/api/users/delete', async (req, res) => {
 });
 
 /**
+ * POST /api/auth/change-password
+ * Change user password securely after security question verification.
+ * Uses Firebase Admin SDK to update the credential safely without triggering
+ * client-side 'auth/requires-recent-login' token staleness errors.
+ */
+app.post('/api/auth/change-password', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Missing authentication token', code: 'UNAUTHORIZED' });
+    }
+
+    let callerUid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      callerUid = decoded.uid;
+    } catch (tokenErr) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired session. Please log in again.', code: 'INVALID_TOKEN' });
+    }
+
+    const { newPassword, securityAnswer } = req.body || {};
+
+    if (!newPassword || newPassword.length < 8) {
+      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters long', code: 'WEAK_PASSWORD' });
+    }
+
+    // Verify user document and security answer in Firestore
+    const userDoc = await db.collection('users').doc(callerUid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User record not found in system', code: 'USER_NOT_FOUND' });
+    }
+
+    const userData = userDoc.data();
+    const storedAnswer = (userData.securityAnswer || '').toString().trim().toLowerCase();
+    const providedAnswer = (securityAnswer || '').toString().trim().toLowerCase();
+
+    if (!storedAnswer) {
+      return res.status(400).json({ success: false, error: 'No security answer configured for this account', code: 'NO_SECURITY_ANSWER' });
+    }
+
+    if (storedAnswer !== providedAnswer) {
+      return res.status(403).json({ success: false, error: 'Security question verification failed. Incorrect answer.', code: 'INVALID_ANSWER' });
+    }
+
+    // Update password in Firebase Auth via Admin SDK
+    await admin.auth().updateUser(callerUid, {
+      password: newPassword
+    });
+
+    console.log(`✓ Password successfully updated via Admin SDK for user: ${callerUid}`);
+    return res.json({
+      success: true,
+      message: 'Password updated successfully'
+    });
+
+  } catch (err) {
+    console.error('❌ Error in POST /api/auth/change-password:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to update password',
+      code: 'UPDATE_PASSWORD_FAILED'
+    });
+  }
+});
+
+/**
  * POST /api/users/create-librarian
  * Create librarian user in Firebase Authentication & Firestore via Admin SDK
  * Never affects or resets the active admin session on the frontend
