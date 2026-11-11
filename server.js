@@ -1402,7 +1402,7 @@ app.post('/api/chat/openrouter', (req, res) => handleSingleProviderChat('openrou
  */
 app.post('/api/staff-copilot/chat', async (req, res) => {
   try {
-    const { message, userRole = 'admin', history = [] } = req.body;
+    const { message, userRole = 'admin', history = [], stream = true } = req.body;
 
     if (!message || message.trim() === '') {
       return res.status(400).json({ error: 'Message is required' });
@@ -1547,28 +1547,54 @@ GROUNDING RULE: Base your guidance strictly on the verified Library Documentatio
 
     messages.push({ role: 'user', content: message });
 
-    // Step 4: Call cascading AI fallback engine
-    const aiResult = await callAIWithFallback(messages, 800);
+    const metadata = {
+      role,
+      ragRetrieved: retrievedChunks.length > 0,
+      sources: retrievedChunks.map(c => ({ title: c.title, landmark: c.landmark, score: c.score }))
+    };
 
-    if (aiResult.success) {
-      return res.json({
-        success: true,
-        reply: aiResult.response,
-        provider: aiResult.provider,
-        role,
-        ragRetrieved: retrievedChunks.length > 0,
-        sources: retrievedChunks.map(c => ({ title: c.title, landmark: c.landmark, score: c.score }))
-      });
+    // Step 4: Stream response via Server-Sent Events (SSE) or fallback to non-streaming JSON
+    const shouldStream = Boolean(stream !== false || req.headers.accept?.includes('text/event-stream'));
+
+    if (shouldStream) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
+      await streamAIWithFallback(messages, 800, res, metadata);
     } else {
-      return res.status(500).json({
-        success: false,
-        error: aiResult.message || 'All AI providers are currently unavailable'
-      });
+      // Non-streaming fallback
+      const aiResult = await callAIWithFallback(messages, 800);
+
+      if (aiResult.success) {
+        return res.json({
+          success: true,
+          reply: aiResult.response,
+          provider: aiResult.provider,
+          providerKey: aiResult.providerKey,
+          attemptNumber: aiResult.attemptNumber,
+          ...metadata
+        });
+      } else {
+        return res.status(500).json({
+          success: false,
+          error: aiResult.message || 'All AI providers are currently unavailable'
+        });
+      }
     }
 
   } catch (error) {
     console.error('❌ Staff Copilot endpoint error:', error);
-    return res.status(500).json({ success: false, error: error.message });
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, error: error.message });
+    } else {
+      res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+      res.end();
+    }
   }
 });
 
