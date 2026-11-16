@@ -1833,12 +1833,15 @@ async function handleUserDeletion(uid, email, res) {
     }
   }
 
-  // 3. Delete user document from Firestore
+  // 3. Delete user document from Firestore and release any claimed ID locks
   let firestoreDeleted = false;
   if (targetUid) {
     try {
       const userDocRef = db.collection('users').doc(targetUid);
       const doc = await userDocRef.get();
+      const existingData = doc.exists ? (doc.data() || {}) : {};
+      await releaseUserIdsFromRegistry(targetUid, existingData);
+
       if (doc.exists) {
         await userDocRef.delete();
         firestoreDeleted = true;
@@ -2635,6 +2638,383 @@ app.post('/api/users/create-librarian', async (req, res) => {
 });
 
 // ============================================
+// REGISTRATION ID UNIQUENESS & ATOMIC PROFILE CLAIM
+// ============================================
+const idCheckRateLimits = new Map();
+
+function normalizeInstitutionalId(rawId) {
+  if (typeof rawId !== 'string' && typeof rawId !== 'number') return '';
+  return String(rawId).trim().replace(/[\s-]+/g, '').toLowerCase();
+}
+
+function buildIdCandidates(rawId, canonicalId) {
+  const trimmed = String(rawId || '').trim();
+  return Array.from(new Set([trimmed, canonicalId, canonicalId.toUpperCase()].filter(Boolean))).slice(0, 10);
+}
+
+function checkIdEndpointRateLimit(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  const clientIp = (typeof fwd === 'string' && fwd.split(',')[0].trim()) || req.ip || 'unknown';
+  const now = Date.now();
+  const windowMs = 60 * 1000;
+
+  if (idCheckRateLimits.size > 5000) {
+    for (const [k, v] of idCheckRateLimits.entries()) {
+      if (now - v.windowStart > windowMs) idCheckRateLimits.delete(k);
+    }
+  }
+
+  const record = idCheckRateLimits.get(clientIp);
+  if (!record || (now - record.windowStart) > windowMs) {
+    idCheckRateLimits.set(clientIp, { count: 1, windowStart: now });
+    return true;
+  }
+  record.count += 1;
+  return record.count <= 30;
+}
+
+async function releaseUserIdsFromRegistry(uid, userData = {}) {
+  if (!uid) return;
+  const candidateCanonicalIds = new Set();
+  const rawValues = [
+    userData.studentId,
+    userData.teacherId,
+    userData.idNumber,
+    userData.employeeId,
+    userData.idVerification && userData.idVerification.idNumber
+  ];
+  for (const val of rawValues) {
+    const cid = normalizeInstitutionalId(val);
+    if (cid) candidateCanonicalIds.add(cid);
+  }
+
+  const byUidSnap = await db.collection('registeredIds').where('uid', '==', uid).get();
+  const byUidsSnap = await db.collection('registeredIds').where('uids', 'array-contains', uid).get();
+  const refMap = new Map();
+  for (const cid of candidateCanonicalIds) {
+    refMap.set(cid, db.collection('registeredIds').doc(cid));
+  }
+  for (const d of [...byUidSnap.docs, ...byUidsSnap.docs]) {
+    refMap.set(d.id, d.ref);
+  }
+
+  for (const ref of refMap.values()) {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const data = snap.data() || {};
+      const owners = new Set([...(Array.isArray(data.uids) ? data.uids : []), data.uid].filter(Boolean));
+      if (!owners.has(uid)) return;
+      owners.delete(uid);
+      if (owners.size === 0) {
+        tx.delete(ref);
+      } else {
+        const remaining = Array.from(owners);
+        tx.update(ref, {
+          uid: remaining[0],
+          uids: remaining,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    });
+  }
+}
+
+async function findExistingIdOwner(rawId, canonicalId, excludeUid = null, tx = null) {
+  const regRef = db.collection('registeredIds').doc(canonicalId);
+  const regSnap = tx ? await tx.get(regRef) : await regRef.get();
+  if (regSnap.exists) {
+    const data = regSnap.data() || {};
+    const owners = new Set([...(Array.isArray(data.uids) ? data.uids : []), data.uid].filter(Boolean));
+    if (excludeUid) owners.delete(excludeUid);
+    if (owners.size > 0) {
+      return { duplicate: true, source: 'registeredIds' };
+    }
+  }
+
+  const candidates = buildIdCandidates(rawId, canonicalId);
+  const queryFields = ['studentId', 'teacherId', 'idNumber', 'employeeId', 'idVerification.idNumber'];
+  const snapshots = await Promise.all(
+    queryFields.map((field) => {
+      const q = db.collection('users').where(field, 'in', candidates).limit(5);
+      return tx ? tx.get(q) : q.get();
+    })
+  );
+
+  for (const snap of snapshots) {
+    for (const doc of snap.docs) {
+      if (!excludeUid || doc.id !== excludeUid) {
+        return { duplicate: true, source: 'users' };
+      }
+    }
+  }
+
+  return { duplicate: false };
+}
+
+async function backfillRegisteredIdsRegistry() {
+  try {
+    const usersSnap = await db.collection('users')
+      .select('studentId', 'teacherId', 'idNumber', 'employeeId', 'idVerification', 'userType')
+      .get();
+
+    for (const userDoc of usersSnap.docs) {
+      const d = userDoc.data() || {};
+      const rawValues = [
+        d.studentId,
+        d.teacherId,
+        d.idNumber,
+        d.employeeId,
+        d.idVerification && d.idVerification.idNumber
+      ].filter(Boolean);
+
+      for (const rawVal of rawValues) {
+        const canonical = normalizeInstitutionalId(rawVal);
+        if (!canonical || !/^[a-z0-9]{4,24}$/.test(canonical)) continue;
+        const regRef = db.collection('registeredIds').doc(canonical);
+        await regRef.set({
+          canonicalId: canonical,
+          idNumber: String(rawVal).trim(),
+          uid: userDoc.id,
+          uids: admin.firestore.FieldValue.arrayUnion(userDoc.id),
+          role: d.userType || 'user',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+    }
+    console.log(`[Auth] Synced ${usersSnap.size} user record(s) into registeredIds registry`);
+  } catch (err) {
+    console.warn('[Auth] Non-critical registeredIds backfill warning:', err.message);
+  }
+}
+
+/**
+ * POST /api/auth/check-id-unique
+ * Authoritative pre-registration uniqueness check (zero PII exposed).
+ */
+app.post('/api/auth/check-id-unique', async (req, res) => {
+  try {
+    if (!checkIdEndpointRateLimit(req)) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many ID verification attempts. Please wait a minute and try again.',
+        code: 'RATE_LIMITED'
+      });
+    }
+
+    const { idNumber } = req.body || {};
+    const rawId = typeof idNumber === 'string' || typeof idNumber === 'number' ? String(idNumber).trim() : '';
+    const canonicalId = normalizeInstitutionalId(rawId);
+
+    if (!canonicalId || !/^[a-z0-9]{4,24}$/.test(canonicalId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid institutional ID number (4-24 alphanumeric characters) is required.',
+        code: 'INVALID_ID_FORMAT'
+      });
+    }
+
+    // Only exclude caller UID if caller proves identity with a valid Firebase ID token
+    let verifiedCallerUid = null;
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (idToken) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        verifiedCallerUid = decoded.uid;
+      } catch (tokenErr) {
+        verifiedCallerUid = null;
+      }
+    }
+
+    const checkResult = await findExistingIdOwner(rawId, canonicalId, verifiedCallerUid);
+    if (checkResult.duplicate) {
+      return res.json({
+        success: true,
+        available: false,
+        duplicate: true,
+        message: 'This institutional ID number is already registered to an existing account.'
+      });
+    }
+
+    return res.json({
+      success: true,
+      available: true,
+      duplicate: false,
+      message: 'Institutional ID number is available.'
+    });
+  } catch (err) {
+    console.error('❌ Error in /api/auth/check-id-unique:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Unable to verify institutional ID uniqueness right now.',
+      code: 'ID_CHECK_ERROR'
+    });
+  }
+});
+
+/**
+ * POST /api/auth/register-profile
+ * Atomically claims unique institutional ID and persists user profile via Firestore transaction.
+ */
+app.post('/api/auth/register-profile', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Missing authentication token.', code: 'UNAUTHORIZED' });
+    }
+
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (tokenErr) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired authentication token.', code: 'UNAUTHORIZED' });
+    }
+
+    const uid = decoded.uid;
+    const body = req.body || {};
+    const userType = typeof body.userType === 'string' ? body.userType.trim().toLowerCase() : '';
+    if (userType !== 'student' && userType !== 'teacher') {
+      return res.status(400).json({
+        success: false,
+        error: 'Self-registration is strictly restricted to student or teacher roles.',
+        code: 'INVALID_ROLE'
+      });
+    }
+
+    const rawId = typeof body.registeredId === 'string' || typeof body.registeredId === 'number'
+      ? String(body.registeredId).trim()
+      : '';
+    const canonicalId = normalizeInstitutionalId(rawId);
+    if (!canonicalId || !/^[a-z0-9]{4,24}$/.test(canonicalId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid institutional ID number is required.',
+        code: 'INVALID_ID_FORMAT'
+      });
+    }
+
+    const firstName = typeof body.firstName === 'string' ? body.firstName.trim().slice(0, 80) : '';
+    const middleName = typeof body.middleName === 'string' ? body.middleName.trim().slice(0, 80) : '';
+    const lastName = typeof body.lastName === 'string' ? body.lastName.trim().slice(0, 80) : '';
+    const fullName = (typeof body.fullName === 'string' && body.fullName.trim())
+      ? body.fullName.trim().slice(0, 180)
+      : [firstName, middleName, lastName].filter(Boolean).join(' ');
+    const email = (decoded.email || (typeof body.email === 'string' ? body.email : '')).trim().toLowerCase();
+    const college = typeof body.college === 'string' ? body.college.trim().slice(0, 40) : '';
+    const program = userType === 'student' && typeof body.program === 'string' ? body.program.trim().slice(0, 40) : null;
+    const department = userType === 'teacher'
+      ? ((typeof body.department === 'string' && body.department.trim()) ? body.department.trim().slice(0, 80) : 'Faculty')
+      : null;
+    const photoURL = typeof body.photoURL === 'string' ? body.photoURL.trim().slice(0, 500) : null;
+    const securityQuestion = typeof body.securityQuestion === 'string' ? body.securityQuestion.trim().slice(0, 120) : null;
+    const securityAnswer = typeof body.securityAnswer === 'string' ? body.securityAnswer.trim().slice(0, 256) : null;
+
+    if (!firstName || !lastName || !email || !college || !securityQuestion || !securityAnswer) {
+      return res.status(400).json({
+        success: false,
+        error: 'Required profile and security fields are incomplete.',
+        code: 'MISSING_FIELDS'
+      });
+    }
+
+    const regIdRef = db.collection('registeredIds').doc(canonicalId);
+    const userRef = db.collection('users').doc(uid);
+
+    await db.runTransaction(async (tx) => {
+      const existingCheck = await findExistingIdOwner(rawId, canonicalId, uid, tx);
+      if (existingCheck.duplicate) {
+        const conflictErr = new Error(`Institutional ID (${rawId}) is already registered to another account.`);
+        conflictErr.statusCode = 409;
+        conflictErr.code = 'ID_ALREADY_EXISTS';
+        throw conflictErr;
+      }
+
+      const existingUserSnap = await tx.get(userRef);
+      if (existingUserSnap.exists) {
+        const existingData = existingUserSnap.data() || {};
+        const alreadyDone = Array.isArray(existingData.authProviders) && existingData.authProviders.includes('password');
+        const oldCid = normalizeInstitutionalId(existingData.studentId || existingData.teacherId || existingData.idNumber);
+        if (alreadyDone && oldCid && oldCid !== canonicalId) {
+          const dupAccountErr = new Error('This account has already completed registration.');
+          dupAccountErr.statusCode = 409;
+          dupAccountErr.code = 'ACCOUNT_ALREADY_REGISTERED';
+          throw dupAccountErr;
+        }
+      }
+
+      const serverTs = admin.firestore.FieldValue.serverTimestamp();
+      tx.set(regIdRef, {
+        canonicalId,
+        idNumber: rawId,
+        uid,
+        uids: admin.firestore.FieldValue.arrayUnion(uid),
+        role: userType,
+        createdAt: serverTs,
+        updatedAt: serverTs
+      }, { merge: true });
+
+      const profileDoc = {
+        uid,
+        userType,
+        firstName,
+        middleName,
+        lastName,
+        fullName,
+        email,
+        photoURL: photoURL || null,
+        idNumber: rawId,
+        studentId: userType === 'student' ? rawId : null,
+        teacherId: userType === 'teacher' ? rawId : null,
+        college,
+        program: program || null,
+        ...(userType === 'teacher' ? { department } : {}),
+        securityQuestion,
+        securityAnswer,
+        idCardVerified: true,
+        termsAccepted: true,
+        termsAcceptedAt: serverTs,
+        idVerification: {
+          verified: true,
+          verifiedAt: serverTs,
+          idNumber: rawId,
+          role: userType,
+          verifiedName: fullName,
+          program: program || null,
+          college: college || null
+        },
+        authProviders: ['google.com', 'password'],
+        createdAt: serverTs,
+        lastLogin: serverTs
+      };
+
+      tx.set(userRef, profileDoc, { merge: true });
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Account profile and unique institutional ID registered successfully.',
+      user: { uid, userType, idNumber: rawId }
+    });
+  } catch (err) {
+    if (err.statusCode === 409) {
+      return res.status(409).json({
+        success: false,
+        error: err.message,
+        code: err.code || 'ID_ALREADY_EXISTS'
+      });
+    }
+    console.error('❌ Error in /api/auth/register-profile:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to finalize registration profile. Please try again.',
+      code: 'REGISTER_PROFILE_ERROR'
+    });
+  }
+});
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 app.get('/api/health', (req, res) => {
@@ -2684,6 +3064,7 @@ app.listen(PORT, () => {
   console.log(`    POST   /api/users/delete - Delete user fallback`);
   console.log(`    GET    /api/health - Health check`);
   console.log(`${'='.repeat(50)}\n`);
+  backfillRegisteredIdsRegistry().catch(() => {});
 });
 
 // ============================================
