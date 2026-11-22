@@ -18,6 +18,9 @@
   ],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "@pinecone-database/pinecone": "^2.2.2",
     "cloudinary": "^2.11.0",
@@ -25,6 +28,7 @@
     "dotenv": "^16.6.1",
     "express": "^4.22.2",
     "firebase-admin": "^12.7.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "undici": "^7.5.0"
   }
 }
