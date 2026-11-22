@@ -12,6 +12,7 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const { Pinecone } = require('@pinecone-database/pinecone');
 const fs = require('fs');
+const crypto = require('crypto');
 let cloudinary = null;
 try {
   cloudinary = require('cloudinary').v2;
@@ -36,17 +37,134 @@ try {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust first reverse-proxy hop (Render) for accurate client IP & HTTPS detection
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+
 // ============================================
-// MIDDLEWARE
+// SECURITY HEADERS, CORS ALLOWLIST & RATE LIMITING
 // ============================================
-app.use(cors({
-  origin: '*',
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://re-caps.web.app',
+  'https://re-caps.firebaseapp.com',
+  'https://recap-backend-jy5b.onrender.com'
+];
+const EXTRA_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ALLOWED_ORIGINS]);
+const LOCALHOST_ORIGIN_REGEX = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
+
+const corsOptions = {
+  origin(origin, callback) {
+    // Allow non-browser / server-to-server requests (e.g., Render health checks)
+    if (!origin) return callback(null, true);
+    const allowLocalhost = !IS_PRODUCTION || process.env.ALLOW_LOCALHOST_CORS === 'true';
+    if (ALLOWED_ORIGINS.has(origin) || (allowLocalhost && LOCALHOST_ORIGIN_REGEX.test(origin))) {
+      return callback(null, true);
+    }
+    console.warn(`[CORS] Blocked disallowed origin: ${origin}`);
+    return callback(null, false);
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
-app.options('*', cors());
-app.use(express.json());
-app.use(express.static('public'));
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  maxAge: 86400
+};
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use(express.json({ limit: '10mb' }));
+
+/**
+ * Lightweight sliding-window IP rate limiter (zero external dependencies)
+ */
+const rateLimitStores = new Map();
+function createRateLimiter({ windowMs, max, keyPrefix, message }) {
+  const store = new Map();
+  rateLimitStores.set(keyPrefix, { store, windowMs });
+
+  return (req, res, next) => {
+    const forwarded = req.headers['x-forwarded-for'];
+    const clientIp = (typeof forwarded === 'string' && forwarded.length > 0)
+      ? forwarded.split(',')[0].trim()
+      : (req.ip || req.socket?.remoteAddress || 'unknown');
+    const key = `${keyPrefix}:${clientIp}`;
+    const now = Date.now();
+
+    let entry = store.get(key);
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 1, resetAt: now + windowMs };
+      store.set(key, entry);
+      return next();
+    }
+
+    entry.count += 1;
+    if (entry.count > max) {
+      const retryAfterSec = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        success: false,
+        error: message || 'Too many requests. Please wait and try again.',
+        retryAfterSeconds: retryAfterSec
+      });
+    }
+    return next();
+  };
+}
+
+// Periodically prune expired rate-limit entries to keep memory bounded
+setInterval(() => {
+  const now = Date.now();
+  for (const { store } of rateLimitStores.values()) {
+    for (const [key, entry] of store.entries()) {
+      if (now > entry.resetAt) store.delete(key);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+const chatRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 30,
+  keyPrefix: 'chat',
+  message: 'Too many AI chat requests. Please wait a minute before sending more.'
+});
+const staffCopilotRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 40,
+  keyPrefix: 'staff-copilot',
+  message: 'Too many Staff Copilot requests. Please wait a minute.'
+});
+const searchRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 60,
+  keyPrefix: 'search',
+  message: 'Too many search requests. Please slow down.'
+});
+const feedbackRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyPrefix: 'feedback',
+  message: 'Too many feedback submissions. Please try again later.'
+});
+const idCheckRateLimiter = createRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  keyPrefix: 'id-check',
+  message: 'Too many ID verification checks. Please wait before trying again.'
+});
 
 // ============================================
 // FIREBASE INITIALIZATION
@@ -80,6 +198,77 @@ admin.initializeApp({
 console.log('Firebase Admin initialized successfully');
 
 const db = admin.firestore();
+
+// ============================================
+// SERVER-SIDE RBAC AUTHENTICATION MIDDLEWARE
+// ============================================
+/**
+ * Verifies Firebase ID token from Authorization: Bearer <token> header
+ * and enforces caller role against Firestore users/{uid}.userType (and custom claims).
+ */
+function requireRole(allowedRoles = []) {
+  return async (req, res, next) => {
+    try {
+      const authHeader = req.headers.authorization || '';
+      const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+      if (!idToken) {
+        return res.status(401).json({
+          success: false,
+          error: 'Authentication required. Missing Bearer token.'
+        });
+      }
+
+      let decoded;
+      try {
+        decoded = await admin.auth().verifyIdToken(idToken);
+      } catch (tokenErr) {
+        return res.status(401).json({
+          success: false,
+          error: 'Invalid or expired authentication token.'
+        });
+      }
+
+      const userDoc = await db.collection('users').doc(decoded.uid).get();
+      const userData = userDoc.exists ? (userDoc.data() || {}) : {};
+      const resolvedRole = userData.userType || decoded.role || null;
+
+      if (userData.status === 'suspended' || userData.status === 'deleted') {
+        return res.status(403).json({
+          success: false,
+          error: 'Account is suspended or inactive.'
+        });
+      }
+
+      if (allowedRoles.length > 0 && !allowedRoles.includes(resolvedRole)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: insufficient privileges for this operation.'
+        });
+      }
+
+      // Keep Firebase custom claim in sync for RTDB/Firestore rule enforcement (non-blocking)
+      if ((resolvedRole === 'admin' || resolvedRole === 'librarian') && decoded.role !== resolvedRole) {
+        admin.auth().setCustomUserClaims(decoded.uid, { role: resolvedRole }).catch(() => {});
+      }
+
+      req.user = {
+        uid: decoded.uid,
+        email: decoded.email || userData.email || '',
+        role: resolvedRole
+      };
+      return next();
+    } catch (authMiddlewareErr) {
+      console.error('[Auth Middleware] Verification error:', authMiddlewareErr.message);
+      return res.status(500).json({
+        success: false,
+        error: 'Authentication verification failed.'
+      });
+    }
+  };
+}
+
+const requireAdmin = requireRole(['admin']);
+const requireStaff = requireRole(['admin', 'librarian']);
 
 // ============================================
 // PINECONE INITIALIZATION
@@ -540,7 +729,7 @@ async function streamAIWithFallback(messages, maxTokens = 1000, res, metadata = 
   res.write(`data: ${JSON.stringify({
     type: 'error',
     error: 'All AI providers are currently unavailable. Please try again later.',
-    details: errors
+    ...(IS_PRODUCTION ? {} : { details: errors })
   })}\n\n`);
   res.end();
 }
@@ -852,7 +1041,7 @@ async function deleteProjectFromPinecone(projectId) {
  * POST /api/projects/sync
  * Sync a project to Pinecone (create or update)
  */
-app.post('/api/projects/sync', async (req, res) => {
+app.post('/api/projects/sync', requireStaff, async (req, res) => {
   const { projectId } = req.body;
   let { projectData } = req.body;
 
@@ -924,7 +1113,7 @@ app.post('/api/projects/sync', async (req, res) => {
  * GET /api/projects/sync-status
  * Query Pinecone directly to get all indexed vector IDs and reconcile Firestore
  */
-app.get('/api/projects/sync-status', async (req, res) => {
+app.get('/api/projects/sync-status', requireStaff, async (req, res) => {
   try {
     const listUrl = `https://${process.env.PINECONE_INDEX_HOST}/vectors/list?namespace=__default__`;
     let vectorIds = [];
@@ -988,7 +1177,7 @@ app.get('/api/projects/sync-status', async (req, res) => {
  * DELETE /api/projects/sync/:projectId
  * Delete a project from Pinecone
  */
-app.delete('/api/projects/sync/:projectId', async (req, res) => {
+app.delete('/api/projects/sync/:projectId', requireStaff, async (req, res) => {
   try {
     const { projectId } = req.params;
     
@@ -1019,7 +1208,7 @@ app.delete('/api/projects/sync/:projectId', async (req, res) => {
  * POST /api/projects/sync-all
  * Sync all projects from Firestore to Pinecone
  */
-app.post('/api/projects/sync-all', async (req, res) => {
+app.post('/api/projects/sync-all', requireAdmin, async (req, res) => {
   try {
     console.log('🔄 Starting full Pinecone sync...');
     
@@ -1094,7 +1283,7 @@ app.post('/api/projects/sync-all', async (req, res) => {
  * Semantic search using Pinecone Inference API
  * Uses the proven working implementation
  */
-app.post('/api/pinecone/search', async (req, res) => {
+app.post('/api/pinecone/search', searchRateLimiter, async (req, res) => {
   try {
     const { query, topK = 10, filter = {} } = req.body;
     
@@ -1200,8 +1389,8 @@ app.post('/api/pinecone/search', async (req, res) => {
     res.json({ matches });
     
   } catch (error) {
-    console.error('❌ Pinecone search error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('[Pinecone] Search error:', error);
+    res.status(500).json({ error: IS_PRODUCTION ? 'Semantic search temporarily unavailable.' : error.message });
   }
 });
 
@@ -1213,7 +1402,7 @@ app.post('/api/pinecone/search', async (req, res) => {
  * POST /api/chat
  * Main chat endpoint with 4-tier fallback and response streaming
  */
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', chatRateLimiter, async (req, res) => {
   try {
     const { message, conversationHistory = [], relevantProjects = [], stream = true, preferredProvider } = req.body;
     
@@ -1393,22 +1582,22 @@ ALLOWED: You may explain what this platform does and how it will work once proje
         res.status(503).json({
           success: false,
           error: 'All AI providers unavailable',
-          details: result.errors,
+          ...(IS_PRODUCTION ? {} : { details: result.errors }),
           fallbackMessage: result.message
         });
       }
     }
     
   } catch (error) {
-    console.error('❌ Chat error:', error);
+    console.error('[Chat] Error:', error);
+    const safeMsg = IS_PRODUCTION ? 'Chat service temporarily unavailable.' : error.message;
     if (!res.headersSent) {
       res.status(500).json({
         success: false,
-        error: 'Chat failed',
-        details: error.message
+        error: safeMsg
       });
     } else {
-      res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'error', error: safeMsg })}\n\n`);
       res.end();
     }
   }
@@ -1445,20 +1634,21 @@ async function handleSingleProviderChat(providerKey, req, res) {
       res.json({ success: true, response, provider: provider.name, providerKey });
     }
   } catch (error) {
-    console.error(`❌ ${providerKey} chat error:`, error.message);
+    console.error(`[Chat] ${providerKey} error:`, error.message);
+    const safeMsg = IS_PRODUCTION ? 'AI provider temporarily unavailable.' : error.message;
     if (!res.headersSent) {
-      res.status(500).json({ success: false, error: error.message });
+      res.status(500).json({ success: false, error: safeMsg });
     } else {
-      res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'error', error: safeMsg })}\n\n`);
       res.end();
     }
   }
 }
 
-app.post('/api/chat/mistral', (req, res) => handleSingleProviderChat('mistral', req, res));
-app.post('/api/chat/groq', (req, res) => handleSingleProviderChat('groq', req, res));
-app.post('/api/chat/gemini', (req, res) => handleSingleProviderChat('gemini', req, res));
-app.post('/api/chat/openrouter', (req, res) => handleSingleProviderChat('openrouter', req, res));
+app.post('/api/chat/mistral', chatRateLimiter, (req, res) => handleSingleProviderChat('mistral', req, res));
+app.post('/api/chat/groq', chatRateLimiter, (req, res) => handleSingleProviderChat('groq', req, res));
+app.post('/api/chat/gemini', chatRateLimiter, (req, res) => handleSingleProviderChat('gemini', req, res));
+app.post('/api/chat/openrouter', chatRateLimiter, (req, res) => handleSingleProviderChat('openrouter', req, res));
 
 // ============================================
 // STAFF COPILOT RAG ENDPOINT (ADMIN & LIBRARIAN)
@@ -1468,7 +1658,7 @@ app.post('/api/chat/openrouter', (req, res) => handleSingleProviderChat('openrou
  * Role-Based RAG Copilot for Head Librarian (Admin) and Library Staff (Librarian)
  * Vector Index: recaps-staff-copilot (multilingual-e5-large)
  */
-app.post('/api/staff-copilot/chat', async (req, res) => {
+app.post('/api/staff-copilot/chat', staffCopilotRateLimiter, requireStaff, async (req, res) => {
   try {
     const { message: rawMessage, userRole = 'admin', history = [], stream = true, preferredProvider = null } = req.body || {};
 
@@ -1480,7 +1670,8 @@ app.post('/api/staff-copilot/chat', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    const role = (userRole === 'librarian') ? 'librarian' : 'admin';
+    // Enforce verified RBAC role: librarians cannot spoof admin scope
+    const role = (req.user.role === 'admin' && userRole !== 'librarian') ? 'admin' : 'librarian';
     const requestedProvider = typeof preferredProvider === 'string' && Object.prototype.hasOwnProperty.call(AI_PROVIDERS, preferredProvider)
       ? preferredProvider
       : null;
@@ -1698,17 +1889,18 @@ GROUNDING RULE: Base your guidance strictly on the verified Library Documentatio
         return res.status(500).json({
           success: false,
           error: aiResult.message || 'All AI providers are currently unavailable',
-          details: aiResult.errors || []
+          ...(IS_PRODUCTION ? {} : { details: aiResult.errors || [] })
         });
       }
     }
 
   } catch (error) {
     console.error('Staff Copilot endpoint error:', error);
+    const safeMsg = IS_PRODUCTION ? 'Staff Copilot temporarily unavailable.' : error.message;
     if (!res.headersSent) {
-      return res.status(500).json({ success: false, error: error.message });
+      return res.status(500).json({ success: false, error: safeMsg });
     } else {
-      res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'error', error: safeMsg })}\n\n`);
       res.end();
     }
   }
@@ -1721,7 +1913,7 @@ GROUNDING RULE: Base your guidance strictly on the verified Library Documentatio
  * DELETE /api/cloudinary/delete
  * Delete image from Cloudinary
  */
-app.delete('/api/cloudinary/delete', async (req, res) => {
+app.delete('/api/cloudinary/delete', requireStaff, async (req, res) => {
   try {
     const { publicId } = req.body;
     
@@ -1869,14 +2061,17 @@ async function handleUserDeletion(uid, email, res) {
  * DELETE /api/users/:uid
  * Delete user from Firebase Authentication and Firestore
  */
-app.delete('/api/users/:uid', async (req, res) => {
+app.delete('/api/users/:uid', requireAdmin, async (req, res) => {
   try {
     const { uid } = req.params;
     const { email } = req.body || {};
+    if (uid && uid === req.user.uid) {
+      return res.status(400).json({ success: false, message: 'Administrators cannot delete their own active account.' });
+    }
     return await handleUserDeletion(uid, email, res);
   } catch (err) {
     console.error('❌ Error in DELETE /api/users/:uid:', err);
-    return res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, message: 'Failed to delete user.' });
   }
 });
 
@@ -1884,31 +2079,147 @@ app.delete('/api/users/:uid', async (req, res) => {
  * POST /api/users/delete
  * Fallback POST endpoint for deleting user
  */
-app.post('/api/users/delete', async (req, res) => {
+app.post('/api/users/delete', requireAdmin, async (req, res) => {
   try {
     const { uid, userId, email } = req.body || {};
     const targetUid = uid || userId;
+    if (targetUid && targetUid === req.user.uid) {
+      return res.status(400).json({ success: false, message: 'Administrators cannot delete their own active account.' });
+    }
     return await handleUserDeletion(targetUid, email, res);
   } catch (err) {
     console.error('❌ Error in POST /api/users/delete:', err);
-    return res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, message: 'Failed to delete user.' });
   }
 });
 
 // ============================================
 // TELEGRAM BOT & 2FA OTP CONFIGURATION
 // ============================================
-const TELEGRAM_OTP_BOT_TOKEN = (process.env.TELEGRAM_OTP_BOT_TOKEN || '8232897628:AAF2Zsn5-xbcgP9qGMIbexd5qAlfc-Idvfo').trim();
-const TELEGRAM_ALERT_BOT_TOKEN = (process.env.TELEGRAM_ALERT_BOT_TOKEN || '9151441003:AAGNOIhGj4lNzTO5fNcwVSdENflX8f6zBv0').trim();
+const TELEGRAM_OTP_BOT_TOKEN = (process.env.TELEGRAM_OTP_BOT_TOKEN || '').trim();
+const TELEGRAM_ALERT_BOT_TOKEN = (process.env.TELEGRAM_ALERT_BOT_TOKEN || '').trim();
+if (!TELEGRAM_OTP_BOT_TOKEN || !TELEGRAM_ALERT_BOT_TOKEN) {
+  console.warn('[Telegram] One or more Telegram bot tokens are unset in environment variables. Configure TELEGRAM_OTP_BOT_TOKEN and TELEGRAM_ALERT_BOT_TOKEN in .env / Render.');
+}
 
 /**
- * Dispatch message to Telegram via Bot HTTP API
+ * Escape HTML special characters before embedding untrusted text in Telegram HTML messages
  */
-async function sendTelegramMessage(botToken, chatId, text, parseMode = 'HTML') {
-  if (!botToken || !chatId) {
-    console.warn('[Telegram] Missing bot token or chatId, skipping message');
+function escapeTelegramHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Cryptographically secure 6-digit OTP generator (CSPRNG)
+ */
+function generateSecureOtp() {
+  return crypto.randomInt(100000, 1000000).toString();
+}
+
+/**
+ * Deterministic SHA-256 digest for in-memory OTP & link verification codes
+ */
+function hashOtpCode(uid, purpose, code) {
+  return crypto
+    .createHash('sha256')
+    .update(`${String(uid)}:${String(purpose)}:${String(code).trim()}`)
+    .digest('hex');
+}
+
+/**
+ * Constant-time hex digest comparison to mitigate timing attacks
+ */
+function timingSafeEqualHex(hexA, hexB) {
+  if (typeof hexA !== 'string' || typeof hexB !== 'string' || hexA.length !== hexB.length) {
     return false;
   }
+  const bufA = Buffer.from(hexA, 'hex');
+  const bufB = Buffer.from(hexB, 'hex');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Mask a Telegram Chat ID for safe UI display (e.g., 123456789 -> •••••6789)
+ */
+function maskTelegramChatId(chatId) {
+  const s = String(chatId || '').trim();
+  if (s.length <= 4) return s;
+  return `${'•'.repeat(Math.min(6, s.length - 4))}${s.slice(-4)}`;
+}
+
+/**
+ * Validate strict numeric private Telegram user Chat ID (5 to 15 positive digits)
+ */
+function validateTelegramChatIdFormat(chatId) {
+  const clean = String(chatId || '').trim();
+  if (!/^\d{5,15}$/.test(clean)) {
+    return { valid: false, clean: '' };
+  }
+  return { valid: true, clean };
+}
+
+/**
+ * Verify via Telegram Bot API getChat that a private user chat exists and is reachable by the bot
+ */
+async function verifyTelegramChat(botToken, chatId) {
+  if (!botToken) {
+    return { ok: false, code: 'TELEGRAM_BOT_UNCONFIGURED', description: 'Telegram bot token is not configured on the server.' };
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/getChat?chat_id=${encodeURIComponent(chatId)}`;
+    const response = await fetch(url, { method: 'GET', signal: controller.signal });
+    const data = await response.json().catch(() => ({}));
+    if (!data.ok || !data.result) {
+      return {
+        ok: false,
+        code: 'TELEGRAM_CHAT_UNREACHABLE',
+        errorCode: data.error_code || response.status,
+        description: data.description || 'Chat not found or user has not started @RecapsOtpBot.'
+      };
+    }
+    if (data.result.type && data.result.type !== 'private') {
+      return {
+        ok: false,
+        code: 'TELEGRAM_PRIVATE_CHAT_REQUIRED',
+        description: 'Only personal private Telegram Chat IDs are permitted for 2FA. Group and channel IDs are not allowed.'
+      };
+    }
+    return {
+      ok: true,
+      chat: {
+        id: String(data.result.id),
+        type: data.result.type || 'private',
+        username: data.result.username || null,
+        firstName: data.result.first_name || null
+      }
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'TELEGRAM_API_ERROR',
+      description: err.name === 'AbortError' ? 'Telegram API verification timed out.' : err.message
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Dispatch message to Telegram via Bot HTTP API with detailed result diagnostics
+ */
+async function sendTelegramMessageDetailed(botToken, chatId, text, parseMode = 'HTML') {
+  if (!botToken || !chatId) {
+    console.warn('[Telegram] Missing bot token or chatId, skipping message');
+    return { ok: false, code: 'TELEGRAM_BOT_UNCONFIGURED', description: 'Missing bot token or chat ID.' };
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
     const response = await fetch(url, {
@@ -1918,18 +2229,38 @@ async function sendTelegramMessage(botToken, chatId, text, parseMode = 'HTML') {
         chat_id: chatId,
         text: text,
         parse_mode: parseMode
-      })
+      }),
+      signal: controller.signal
     });
-    const result = await response.json();
+    const result = await response.json().catch(() => ({}));
     if (!result.ok) {
-      console.error('[Telegram] API Error:', result.description);
-      return false;
+      console.error('[Telegram] API Error:', result.description || response.status);
+      return {
+        ok: false,
+        code: result.error_code === 403 ? 'TELEGRAM_BOT_BLOCKED' : 'TELEGRAM_DELIVERY_FAILED',
+        errorCode: result.error_code || response.status,
+        description: result.description || 'Telegram rejected the message.'
+      };
     }
-    return true;
+    return { ok: true, result: result.result };
   } catch (err) {
     console.error('[Telegram] Dispatch failed:', err.message);
-    return false;
+    return {
+      ok: false,
+      code: 'TELEGRAM_NETWORK_ERROR',
+      description: err.name === 'AbortError' ? 'Telegram API request timed out.' : err.message
+    };
+  } finally {
+    clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Dispatch message to Telegram via Bot HTTP API (boolean convenience wrapper)
+ */
+async function sendTelegramMessage(botToken, chatId, text, parseMode = 'HTML') {
+  const res = await sendTelegramMessageDetailed(botToken, chatId, text, parseMode);
+  return res.ok;
 }
 
 // Lightweight Telegram update poller for RecapsOtpBot: auto-replies with user's Chat ID when they message /start
@@ -1946,11 +2277,12 @@ async function pollTelegramUpdates() {
         const msg = update.message;
         if (msg && msg.text && msg.chat && msg.chat.id) {
           const chatId = msg.chat.id;
-          const senderName = msg.from ? (msg.from.first_name || 'User') : 'User';
-          const replyText = `👋 Hello <b>${senderName}</b>!\n\n` +
-            `🔐 <b>RE-CAPS Security Bot</b>\n` +
-            `Your Telegram Chat ID is: <code>${chatId}</code>\n\n` +
-            `📋 <i>Copy and paste this ID into your RE-CAPS Account Settings to enable 2FA OTP verification and instant security notifications.</i>`;
+          const senderName = escapeTelegramHtml(msg.from ? (msg.from.first_name || 'User') : 'User');
+          const replyText = `<b>RE-CAPS Security Bot (@RecapsOtpBot)</b>\n\n` +
+            `Hello <b>${senderName}</b>,\n` +
+            `Your personal Telegram Chat ID is:\n\n` +
+            `<code>${chatId}</code>\n\n` +
+            `<i>Copy this numeric ID into RE-CAPS Settings &gt; Change Password to request your 6-digit verification challenge code and complete 2FA enrollment.</i>`;
           await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, chatId, replyText);
         }
       }
@@ -1961,75 +2293,135 @@ async function pollTelegramUpdates() {
 }
 setInterval(pollTelegramUpdates, 12000);
 
-// In-Memory Rate Limiting & OTP Storage
-// rateLimits: key -> { count, firstAttempt, failedCount, lockedUntil }
-const passwordChangeRateLimits = new Map();
-// otps: uid -> { otp, expiresAt, attempts }
+// In-Memory 2FA OTP, Enrollment Challenge, Unlink PIN & Step-1 Verified Session Storage
+// Persistent 3-strike -> 24-hour lockout is stored authoritatively in Firestore (users/{uid}.securityLockout)
+const MAX_VERIFICATION_FAILURES = 3;
+const LOCKOUT_DURATION_MS = 24 * 60 * 60 * 1000; // Strict 24-hour lockout after 3 failures
+
+// otps: uid -> { otpHash, expiresAt, requestedAt }
 const passwordChangeOtps = new Map();
+// telegramLinkChallenges: uid -> { chatId, codeHash, expiresAt, requestedAt, telegramUsername, telegramFirstName }
+const telegramLinkChallenges = new Map();
+// telegramUnlinkChallenges: uid -> { chatId, codeHash, expiresAt, requestedAt }
+const telegramUnlinkChallenges = new Map();
+// verifiedStep1Sessions: uid -> { tokenHash, expiresAt, role }
+const verifiedStep1Sessions = new Map();
+
+function formatLockoutDuration(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const totalMins = Math.ceil(safeMs / 60000);
+  const hours = Math.floor(totalMins / 60);
+  const mins = totalMins % 60;
+  if (hours > 0 && mins > 0) return `${hours}h ${mins}m`;
+  if (hours > 0) return `${hours}h 00m`;
+  return `${Math.max(1, mins)}m`;
+}
 
 /**
- * Layer 2: Rate Limiting & Exponential Lockout
- * 24-hour window: 10 attempts max
- * 5 consecutive failures: 1-hour lockout
+ * Evaluate persistent 24-hour security lockout from Firestore user document
  */
-function checkPasswordChangeRateLimit(key) {
+function getPersistentLockoutState(userData) {
   const now = Date.now();
-  let record = passwordChangeRateLimits.get(key);
-  if (!record) {
-    record = { count: 0, firstAttempt: now, failedCount: 0, lockedUntil: null };
-    passwordChangeRateLimits.set(key, record);
+  const lock = (userData && userData.securityLockout && typeof userData.securityLockout === 'object')
+    ? userData.securityLockout
+    : null;
+  if (!lock) {
+    return { locked: false, failedAttempts: 0, lockedUntil: null, remainingMs: 0 };
   }
-
-  // Check 1-hour lockout
-  if (record.lockedUntil && now < record.lockedUntil) {
-    const remainingMins = Math.ceil((record.lockedUntil - now) / 60000);
+  const lockedUntil = Number(lock.lockedUntil) || 0;
+  if (lockedUntil > now) {
+    const remainingMs = lockedUntil - now;
     return {
-      allowed: false,
-      message: `Account temporarily locked due to 5 consecutive failed attempts. Please try again in ${remainingMins} minute(s).`,
-      code: 'ACCOUNT_LOCKED_1_HOUR'
+      locked: true,
+      failedAttempts: Number(lock.failedAttempts) || MAX_VERIFICATION_FAILURES,
+      lockedUntil,
+      remainingMs,
+      code: 'ACCOUNT_LOCKED_24H',
+      message: `Security lockout active after ${MAX_VERIFICATION_FAILURES} consecutive failed verification attempts. Try again in ${formatLockoutDuration(remainingMs)}.`
+    };
+  }
+  // If a prior lockout already expired, start clean at 0 failures
+  if (lockedUntil > 0 && lockedUntil <= now) {
+    return { locked: false, failedAttempts: 0, lockedUntil: null, remainingMs: 0 };
+  }
+  return {
+    locked: false,
+    failedAttempts: Number(lock.failedAttempts) || 0,
+    lockedUntil: null,
+    remainingMs: 0
+  };
+}
+
+/**
+ * Persist verification strike to Firestore; enforce immediate 24-hour lockout on 3rd failure
+ */
+async function recordPersistentVerificationFailure(uid, userData, reason, clientIp = 'unknown') {
+  const state = getPersistentLockoutState(userData);
+  const nextFailures = state.failedAttempts + 1;
+  const now = Date.now();
+  const triggeredLockout = nextFailures >= MAX_VERIFICATION_FAILURES;
+  const lockedUntil = triggeredLockout ? (now + LOCKOUT_DURATION_MS) : null;
+
+  const lockoutPayload = {
+    failedAttempts: nextFailures,
+    lockedUntil,
+    lockedReason: triggeredLockout ? reason : null,
+    lastFailedAt: new Date(now).toISOString(),
+    lastFailedIp: clientIp
+  };
+
+  await db.collection('users').doc(uid).set({
+    securityLockout: lockoutPayload
+  }, { merge: true });
+
+  if (triggeredLockout) {
+    // Immediately invalidate all in-flight OTPs, PINs, challenges, and step-1 tokens
+    passwordChangeOtps.delete(uid);
+    telegramLinkChallenges.delete(uid);
+    telegramUnlinkChallenges.delete(uid);
+    verifiedStep1Sessions.delete(uid);
+
+    // Notify verified Telegram owner of automatic 24-hour lockout (non-blocking)
+    const chatId = userData && userData.telegramChatId ? String(userData.telegramChatId).trim() : '';
+    if (chatId && TELEGRAM_OTP_BOT_TOKEN) {
+      const lockNotice = `<b>RE-CAPS Security Lockout Triggered (24 Hours)</b>\n\n` +
+        `3 consecutive incorrect verification attempts were detected on your account (${escapeTelegramHtml(reason)}).\n\n` +
+        `<b>Source IP:</b> <code>${escapeTelegramHtml(clientIp)}</code>\n` +
+        `<b>Lock Duration:</b> 24 hours\n\n` +
+        `<i>Password changes and Telegram 2FA changes are automatically locked for 24 hours to protect your account.</i>`;
+      sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, chatId, lockNotice).catch(() => {});
+    }
+
+    return {
+      locked: true,
+      attemptsUsed: nextFailures,
+      remainingAttempts: 0,
+      lockedUntil,
+      remainingMs: LOCKOUT_DURATION_MS
     };
   }
 
-  // Reset 24-hour cycle
-  if (now - record.firstAttempt > 24 * 60 * 60 * 1000) {
-    record.count = 0;
-    record.firstAttempt = now;
-  }
-
-  // Check 10 attempts per 24 hours
-  if (record.count >= 10) {
-    return {
-      allowed: false,
-      message: 'Daily password change limit reached (maximum 10 attempts per 24 hours). Please try again tomorrow.',
-      code: 'DAILY_RATE_LIMIT_EXCEEDED'
-    };
-  }
-
-  return { allowed: true, record };
+  return {
+    locked: false,
+    attemptsUsed: nextFailures,
+    remainingAttempts: MAX_VERIFICATION_FAILURES - nextFailures,
+    lockedUntil: null,
+    remainingMs: 0
+  };
 }
 
-function recordPasswordChangeFailure(key) {
-  let record = passwordChangeRateLimits.get(key);
-  if (!record) {
-    record = { count: 1, firstAttempt: Date.now(), failedCount: 1, lockedUntil: null };
-    passwordChangeRateLimits.set(key, record);
-  } else {
-    record.count++;
-    record.failedCount++;
-  }
-
-  if (record.failedCount >= 5) {
-    record.lockedUntil = Date.now() + 60 * 60 * 1000; // 1-hour lockout
-  }
-}
-
-function recordPasswordChangeSuccess(key) {
-  let record = passwordChangeRateLimits.get(key);
-  if (record) {
-    record.count++;
-    record.failedCount = 0;
-    record.lockedUntil = null;
-  }
+/**
+ * Reset persistent verification strikes on successful authentication
+ */
+async function clearPersistentVerificationFailures(uid) {
+  await db.collection('users').doc(uid).set({
+    securityLockout: {
+      failedAttempts: 0,
+      lockedUntil: null,
+      lockedReason: null,
+      clearedAt: new Date().toISOString()
+    }
+  }, { merge: true });
 }
 
 // Layer 3: Password Policy Enforcement
@@ -2103,7 +2495,7 @@ async function verifyUserCurrentPassword(email, currentPassword) {
 
 /**
  * POST /api/auth/telegram/send-otp
- * Sends a 6-digit OTP to user's linked Telegram Chat ID via RecapsOtpBot
+ * Sends a CSPRNG 6-digit OTP strictly to the user's verified Telegram Chat ID stored in Firestore
  */
 app.post('/api/auth/telegram/send-otp', async (req, res) => {
   try {
@@ -2111,6 +2503,14 @@ app.post('/api/auth/telegram/send-otp', async (req, res) => {
     const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
     if (!idToken) {
       return res.status(401).json({ success: false, error: 'Unauthorized: Missing token', code: 'UNAUTHORIZED' });
+    }
+
+    if (!TELEGRAM_OTP_BOT_TOKEN) {
+      return res.status(503).json({
+        success: false,
+        error: 'Telegram 2FA service is not configured on the server.',
+        code: 'TELEGRAM_BOT_UNCONFIGURED'
+      });
     }
 
     const decoded = await admin.auth().verifyIdToken(idToken);
@@ -2121,63 +2521,105 @@ app.post('/api/auth/telegram/send-otp', async (req, res) => {
       return res.status(404).json({ success: false, error: 'User record not found', code: 'USER_NOT_FOUND' });
     }
 
-    const userData = userDoc.data();
-    const chatId = userData.telegramChatId || (req.body && req.body.telegramChatId);
+    const userData = userDoc.data() || {};
 
-    if (!chatId) {
+    // Layer 2: Enforce persistent 24-hour lockout before allowing new OTP dispatch
+    const lockState = getPersistentLockoutState(userData);
+    if (lockState.locked) {
+      return res.status(429).json({
+        success: false,
+        error: lockState.message,
+        code: lockState.code,
+        lockedUntil: lockState.lockedUntil,
+        remainingMs: lockState.remainingMs
+      });
+    }
+
+    // Security rule: NEVER allow unverified request-body chatId override for 2FA OTP dispatch
+    const { valid: chatFormatValid, clean: chatId } = validateTelegramChatIdFormat(userData.telegramChatId);
+
+    if (!chatId || !chatFormatValid) {
       return res.status(400).json({
         success: false,
-        error: 'No Telegram account linked. Please open @RecapsOtpBot on Telegram to get your Chat ID, then save it in your settings.',
+        error: 'No verified Telegram account is linked. Link and confirm your Chat ID via @RecapsOtpBot first.',
         code: 'NO_TELEGRAM_LINKED'
       });
     }
 
-    // Rate limit OTP requests: 1 request every 30 seconds
+    // Require verified enrollment status for industrial 2FA security
+    if (userData.telegramVerified === false) {
+      return res.status(400).json({
+        success: false,
+        error: 'Your linked Telegram Chat ID has not completed ownership verification. Please unlink and re-verify.',
+        code: 'TELEGRAM_NOT_VERIFIED'
+      });
+    }
+
+    // Rate limit OTP requests: 1 successful dispatch every 30 seconds
     const existingOtp = passwordChangeOtps.get(callerUid);
-    if (existingOtp && Date.now() < existingOtp.expiresAt - (4.5 * 60 * 1000)) {
+    if (existingOtp && (Date.now() - existingOtp.requestedAt) < 30 * 1000) {
+      const waitSecs = Math.ceil((30 * 1000 - (Date.now() - existingOtp.requestedAt)) / 1000);
       return res.status(429).json({
         success: false,
-        error: 'Please wait 30 seconds before requesting another OTP.',
+        error: `Please wait ${waitSecs} second(s) before requesting another OTP.`,
         code: 'OTP_RATE_LIMITED'
       });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    passwordChangeOtps.set(callerUid, {
-      otp,
-      expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes validity
-      attempts: 0
-    });
-
-    const otpMessage = `🔐 <b>RE-CAPS Security Verification</b>\n\n` +
-      `Your One-Time Password (OTP) for changing your account password is:\n\n` +
-      `  👉 <code>${otp}</code> 👈\n\n` +
-      `⏰ <i>This code will expire in <b>5 minutes</b>.</i>\n` +
-      `⚠️ <b>Security Notice:</b> Never share this code with anyone.`;
-
-    const dispatched = await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, chatId, otpMessage);
-    if (!dispatched) {
-      return res.status(500).json({
+    // Verify live reachability before generating/storing OTP
+    const chatCheck = await verifyTelegramChat(TELEGRAM_OTP_BOT_TOKEN, chatId);
+    if (!chatCheck.ok) {
+      return res.status(400).json({
         success: false,
-        error: 'Failed to deliver OTP to Telegram. Ensure you have opened @RecapsOtpBot and clicked Start.',
-        code: 'TELEGRAM_DISPATCH_FAILED'
+        error: 'Your linked Telegram Chat ID could not be reached by @RecapsOtpBot. Click "Change / Unlink" to link a valid Chat ID after pressing Start in @RecapsOtpBot.',
+        code: 'TELEGRAM_CHAT_INVALID'
       });
     }
 
+    const otp = generateSecureOtp();
+    const otpMessage = `<b>RE-CAPS Security Verification (2FA OTP)</b>\n\n` +
+      `Your One-Time Password (OTP) to authorize a password change is:\n\n` +
+      `<code>${otp}</code>\n\n` +
+      `<i>Valid for <b>5 minutes</b> (single-use).</i>\n` +
+      `<b>Security Notice:</b> Never share this code with anyone. If you did not request this, secure your account immediately.`;
+
+    const dispatch = await sendTelegramMessageDetailed(TELEGRAM_OTP_BOT_TOKEN, chatId, otpMessage);
+    if (!dispatch.ok) {
+      return res.status(400).json({
+        success: false,
+        error: dispatch.code === 'TELEGRAM_BOT_BLOCKED'
+          ? 'Delivery failed: @RecapsOtpBot is blocked or has not been started in Telegram. Unblock/start @RecapsOtpBot or re-link your Chat ID.'
+          : 'Failed to deliver OTP to the linked Telegram Chat ID. Click "Change / Unlink" to verify and link a valid Chat ID.',
+        code: 'TELEGRAM_CHAT_INVALID'
+      });
+    }
+
+    passwordChangeOtps.set(callerUid, {
+      otpHash: hashOtpCode(callerUid, 'password_change', otp),
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      requestedAt: Date.now(),
+      attempts: 0
+    });
+
     return res.json({
       success: true,
-      message: 'OTP has been dispatched to your Telegram account via @RecapsOtpBot'
+      maskedChatId: maskTelegramChatId(chatId),
+      expiresInSeconds: 300,
+      message: `OTP dispatched via @RecapsOtpBot to ${maskTelegramChatId(chatId)}.`
     });
 
   } catch (err) {
-    console.error('❌ Error in /api/auth/telegram/send-otp:', err);
-    return res.status(500).json({ success: false, error: err.message, code: 'OTP_SEND_ERROR' });
+    console.error('[Telegram] Error in /api/auth/telegram/send-otp:', err);
+    return res.status(500).json({ success: false, error: 'Failed to dispatch OTP due to a server error.', code: 'OTP_SEND_ERROR' });
   }
 });
 
 /**
  * POST /api/auth/telegram/save-chat-id
- * Links or updates user's Telegram Chat ID in Firestore
+ * Industrial 2FA Enrollment Step 1:
+ * Validates Chat ID format, verifies live private chat reachability with @RecapsOtpBot (getChat),
+ * dispatches a CSPRNG 6-digit Proof-of-Possession challenge code, and DOES NOT write to Firestore
+ * until ownership is confirmed via POST /api/auth/telegram/confirm-link.
  */
 app.post('/api/auth/telegram/save-chat-id', async (req, res) => {
   try {
@@ -2187,47 +2629,655 @@ app.post('/api/auth/telegram/save-chat-id', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Unauthorized: Missing token', code: 'UNAUTHORIZED' });
     }
 
+    if (!TELEGRAM_OTP_BOT_TOKEN) {
+      return res.status(503).json({
+        success: false,
+        error: 'Telegram 2FA bot is not configured on the server. Contact the system administrator.',
+        code: 'TELEGRAM_BOT_UNCONFIGURED'
+      });
+    }
+
     const decoded = await admin.auth().verifyIdToken(idToken);
     const callerUid = decoded.uid;
+    const callerEmail = escapeTelegramHtml(decoded.email || 'RE-CAPS Account');
     const { telegramChatId } = req.body || {};
 
-    if (!telegramChatId || !/^\d+$/.test(telegramChatId.toString().trim())) {
-      return res.status(400).json({ success: false, error: 'Invalid Telegram Chat ID format. Must be numeric.', code: 'INVALID_CHAT_ID' });
+    const userDoc = await db.collection('users').doc(callerUid).get();
+    const userData = userDoc.exists ? (userDoc.data() || {}) : {};
+    const lockState = getPersistentLockoutState(userData);
+    if (lockState.locked) {
+      return res.status(429).json({
+        success: false,
+        error: lockState.message,
+        code: lockState.code,
+        lockedUntil: lockState.lockedUntil,
+        remainingMs: lockState.remainingMs
+      });
     }
 
-    const cleanChatId = telegramChatId.toString().trim();
-
-    // Verify chat ID can receive messages
-    const pingText = `✅ <b>RE-CAPS Telegram Integration Connected!</b>\n\n` +
-      `Your Telegram account has been linked successfully.\n` +
-      `You will receive 2FA verification codes and instant security alerts here.`;
-
-    const sent = await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, cleanChatId, pingText);
-    if (!sent) {
-      // Try with OTP bot token as fallback
-      await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, cleanChatId, pingText);
+    // Prevent overwriting an already-verified Telegram without going through PIN-protected unlink first
+    if (userData.telegramChatId && userData.telegramVerified === true) {
+      return res.status(403).json({
+        success: false,
+        error: 'Your Telegram 2FA is already verified. Authorize unlinking with the PIN sent to your current Telegram before linking a new Chat ID.',
+        code: 'UNLINK_PIN_REQUIRED'
+      });
     }
 
-    await db.collection('users').doc(callerUid).update({
-      telegramChatId: cleanChatId,
-      telegramLinkedAt: new Date().toISOString()
+    const { valid, clean: cleanChatId } = validateTelegramChatIdFormat(telegramChatId);
+    if (!valid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid Telegram Chat ID. Enter a valid 5–15 digit personal numeric Chat ID from @RecapsOtpBot.',
+        code: 'INVALID_CHAT_ID'
+      });
+    }
+
+    // Rate limit link challenge dispatches (1 per 20 seconds per user)
+    const existingChallenge = telegramLinkChallenges.get(callerUid);
+    if (existingChallenge && (Date.now() - existingChallenge.requestedAt) < 20 * 1000) {
+      const waitSecs = Math.ceil((20 * 1000 - (Date.now() - existingChallenge.requestedAt)) / 1000);
+      return res.status(429).json({
+        success: false,
+        error: `Please wait ${waitSecs} second(s) before requesting another verification code.`,
+        code: 'LINK_RATE_LIMITED'
+      });
+    }
+
+    // Step 1A: Fail-closed live check against Telegram Bot API (getChat)
+    const chatCheck = await verifyTelegramChat(TELEGRAM_OTP_BOT_TOKEN, cleanChatId);
+    if (!chatCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        error: chatCheck.code === 'TELEGRAM_PRIVATE_CHAT_REQUIRED'
+          ? chatCheck.description
+          : 'Telegram Chat ID does not exist or has not started @RecapsOtpBot. Open @RecapsOtpBot in Telegram, click Start, and copy the exact numeric Chat ID it replies with.',
+        code: chatCheck.code || 'TELEGRAM_CHAT_UNREACHABLE'
+      });
+    }
+
+    // Step 1B: Dispatch CSPRNG 6-digit Proof-of-Possession challenge code directly to that Telegram chat
+    const linkCode = generateSecureOtp();
+    const challengeMsg = `<b>RE-CAPS 2FA Enrollment Challenge</b>\n\n` +
+      `A request was made to link this Telegram account to <b>${callerEmail}</b>.\n\n` +
+      `Enter this 6-digit verification code in RE-CAPS to confirm ownership:\n\n` +
+      `<code>${linkCode}</code>\n\n` +
+      `<i>Expires in <b>5 minutes</b>. If you did not initiate this request, ignore this message — your Telegram has NOT been linked.</i>`;
+
+    const delivery = await sendTelegramMessageDetailed(TELEGRAM_OTP_BOT_TOKEN, cleanChatId, challengeMsg);
+    if (!delivery.ok) {
+      return res.status(400).json({
+        success: false,
+        error: delivery.code === 'TELEGRAM_BOT_BLOCKED'
+          ? 'Unable to send verification code because @RecapsOtpBot is blocked. Unblock @RecapsOtpBot in Telegram and press Start, then try again.'
+          : 'Could not deliver verification code to this Chat ID. Ensure you started @RecapsOtpBot and copied your exact numeric Chat ID.',
+        code: delivery.code || 'TELEGRAM_DELIVERY_FAILED'
+      });
+    }
+
+    // Store hashed pending challenge in memory ONLY — zero Firestore write until code is confirmed!
+    telegramLinkChallenges.set(callerUid, {
+      chatId: cleanChatId,
+      codeHash: hashOtpCode(callerUid, 'telegram_link', linkCode),
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      requestedAt: Date.now(),
+      attempts: 0,
+      telegramUsername: chatCheck.chat.username || null,
+      telegramFirstName: chatCheck.chat.firstName || null
     });
 
     return res.json({
       success: true,
-      message: 'Telegram Chat ID linked and verified successfully!'
+      requiresVerification: true,
+      maskedChatId: maskTelegramChatId(cleanChatId),
+      telegramFirstName: chatCheck.chat.firstName || null,
+      expiresInSeconds: 300,
+      message: 'Verification code sent via @RecapsOtpBot. Enter the 6-digit code to verify ownership and complete linking.'
     });
   } catch (err) {
-    console.error('❌ Error in /api/auth/telegram/save-chat-id:', err);
-    return res.status(500).json({ success: false, error: err.message, code: 'LINK_CHAT_ERROR' });
+    console.error('[Telegram] Error in /api/auth/telegram/save-chat-id:', err);
+    return res.status(500).json({ success: false, error: 'Failed to verify Telegram Chat ID due to a server error.', code: 'LINK_CHAT_ERROR' });
+  }
+});
+
+/**
+ * POST /api/auth/telegram/confirm-link
+ * Industrial 2FA Enrollment Step 2:
+ * Verifies the 6-digit Proof-of-Possession challenge code in constant time and ONLY THEN
+ * persists the verified telegramChatId to Firestore.
+ */
+app.post('/api/auth/telegram/confirm-link', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing token', code: 'UNAUTHORIZED' });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const callerUid = decoded.uid;
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
+    const { verificationCode } = req.body || {};
+
+    const userDoc = await db.collection('users').doc(callerUid).get();
+    const userData = userDoc.exists ? (userDoc.data() || {}) : {};
+    const lockState = getPersistentLockoutState(userData);
+    if (lockState.locked) {
+      return res.status(429).json({
+        success: false,
+        error: lockState.message,
+        code: lockState.code,
+        lockedUntil: lockState.lockedUntil,
+        remainingMs: lockState.remainingMs
+      });
+    }
+
+    const cleanCode = String(verificationCode || '').trim();
+    if (!/^\d{6}$/.test(cleanCode)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Enter the exact 6-digit verification code sent by @RecapsOtpBot.',
+        code: 'INVALID_LINK_CODE_FORMAT'
+      });
+    }
+
+    const challenge = telegramLinkChallenges.get(callerUid);
+    if (!challenge) {
+      return res.status(400).json({
+        success: false,
+        error: 'No active linking challenge found. Enter your Chat ID and request a new verification code.',
+        code: 'NO_PENDING_LINK'
+      });
+    }
+
+    if (Date.now() > challenge.expiresAt) {
+      telegramLinkChallenges.delete(callerUid);
+      return res.status(400).json({
+        success: false,
+        error: 'Verification code expired (5-minute limit). Request a new code to link your Telegram account.',
+        code: 'LINK_CODE_EXPIRED'
+      });
+    }
+
+    const providedHash = hashOtpCode(callerUid, 'telegram_link', cleanCode);
+    if (!timingSafeEqualHex(challenge.codeHash, providedHash)) {
+      const strike = await recordPersistentVerificationFailure(callerUid, userData, 'Telegram 2FA enrollment code mismatch', clientIp);
+      if (strike.locked) {
+        return res.status(429).json({
+          success: false,
+          error: `3 consecutive incorrect verification codes entered. Security lockout active for 24 hours (${formatLockoutDuration(strike.remainingMs)}).`,
+          code: 'ACCOUNT_LOCKED_24H',
+          lockedUntil: strike.lockedUntil,
+          remainingMs: strike.remainingMs
+        });
+      }
+      return res.status(403).json({
+        success: false,
+        error: `Incorrect verification code. ${strike.remainingAttempts} attempt(s) remaining before 24-hour security lockout.`,
+        code: 'INVALID_LINK_CODE',
+        remainingAttempts: strike.remainingAttempts
+      });
+    }
+
+    // Single-use consumption + strike reset: persist verified Chat ID to Firestore
+    telegramLinkChallenges.delete(callerUid);
+    await clearPersistentVerificationFailures(callerUid);
+    const linkedAt = new Date().toISOString();
+
+    await db.collection('users').doc(callerUid).update({
+      telegramChatId: challenge.chatId,
+      telegramVerified: true,
+      telegramLinkedAt: linkedAt,
+      telegramUsername: challenge.telegramUsername || null
+    });
+
+    // Send non-blocking enrollment confirmation notice via @RecapsOtpBot
+    const confirmedMsg = `<b>RE-CAPS Telegram 2FA Verified</b>\n\n` +
+      `Your Telegram account has been verified and linked for 2-Factor Authentication.\n` +
+      `You will receive 6-digit verification codes and security alerts here.`;
+    sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, challenge.chatId, confirmedMsg).catch(() => {});
+
+    return res.json({
+      success: true,
+      telegramVerified: true,
+      maskedChatId: maskTelegramChatId(challenge.chatId),
+      telegramLinkedAt: linkedAt,
+      message: 'Telegram 2FA verified and linked successfully.'
+    });
+  } catch (err) {
+    console.error('[Telegram] Error in /api/auth/telegram/confirm-link:', err);
+    return res.status(500).json({ success: false, error: 'Failed to confirm Telegram linking.', code: 'CONFIRM_LINK_ERROR' });
+  }
+});
+
+/**
+ * POST /api/auth/telegram/request-unlink-otp
+ * Dispatches a 6-digit CSPRNG Authorization PIN to the CURRENTLY linked Telegram Chat ID
+ * before permitting the user to change/unlink their verified Telegram 2FA.
+ */
+app.post('/api/auth/telegram/request-unlink-otp', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing token', code: 'UNAUTHORIZED' });
+    }
+
+    if (!TELEGRAM_OTP_BOT_TOKEN) {
+      return res.status(503).json({
+        success: false,
+        error: 'Telegram 2FA service is not configured on the server.',
+        code: 'TELEGRAM_BOT_UNCONFIGURED'
+      });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const callerUid = decoded.uid;
+
+    const userDoc = await db.collection('users').doc(callerUid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User record not found', code: 'USER_NOT_FOUND' });
+    }
+
+    const userData = userDoc.data() || {};
+    const lockState = getPersistentLockoutState(userData);
+    if (lockState.locked) {
+      return res.status(429).json({
+        success: false,
+        error: lockState.message,
+        code: lockState.code,
+        lockedUntil: lockState.lockedUntil,
+        remainingMs: lockState.remainingMs
+      });
+    }
+
+    const { valid: chatFormatValid, clean: currentChatId } = validateTelegramChatIdFormat(userData.telegramChatId);
+    if (!currentChatId || !chatFormatValid) {
+      return res.json({
+        success: true,
+        requiresUnlinkPin: false,
+        message: 'No valid Telegram Chat ID is currently linked.'
+      });
+    }
+
+    // Check if the currently stored Chat ID is actually reachable via @RecapsOtpBot
+    const chatCheck = await verifyTelegramChat(TELEGRAM_OTP_BOT_TOKEN, currentChatId);
+    if (!chatCheck.ok && userData.telegramVerified !== true) {
+      // Legacy unreachable fake ID: permit clean immediate unlink without blocking recovery
+      return res.json({
+        success: true,
+        requiresUnlinkPin: false,
+        legacyUnreachable: true,
+        message: 'Unverified legacy Chat ID is unreachable on Telegram and can be replaced directly.'
+      });
+    }
+    if (!chatCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unable to reach your verified Telegram account via @RecapsOtpBot. Ensure @RecapsOtpBot is unblocked and started in Telegram.',
+        code: 'TELEGRAM_CHAT_UNREACHABLE'
+      });
+    }
+
+    // Rate limit unlink PIN requests (1 per 30 seconds)
+    const existingPin = telegramUnlinkChallenges.get(callerUid);
+    if (existingPin && (Date.now() - existingPin.requestedAt) < 30 * 1000) {
+      const waitSecs = Math.ceil((30 * 1000 - (Date.now() - existingPin.requestedAt)) / 1000);
+      return res.status(429).json({
+        success: false,
+        error: `Please wait ${waitSecs} second(s) before requesting another unlink PIN.`,
+        code: 'UNLINK_PIN_RATE_LIMITED'
+      });
+    }
+
+    const unlinkPin = generateSecureOtp();
+    const pinMsg = `<b>RE-CAPS Telegram 2FA Change Authorization PIN</b>\n\n` +
+      `A request was made to <b>change / unlink</b> your verified Telegram 2FA account.\n\n` +
+      `Enter this 6-digit authorization PIN in RE-CAPS to confirm:\n\n` +
+      `<code>${unlinkPin}</code>\n\n` +
+      `<i>Valid for <b>5 minutes</b> (single-use). 3 failed attempts trigger an automatic 24-hour lockout.</i>\n` +
+      `<b>Security Notice:</b> If you did not request this, ignore this message — your Telegram 2FA remains locked and protected.`;
+
+    const delivery = await sendTelegramMessageDetailed(TELEGRAM_OTP_BOT_TOKEN, currentChatId, pinMsg);
+    if (!delivery.ok) {
+      return res.status(400).json({
+        success: false,
+        error: 'Failed to deliver authorization PIN to your current Telegram account via @RecapsOtpBot.',
+        code: 'TELEGRAM_DELIVERY_FAILED'
+      });
+    }
+
+    telegramUnlinkChallenges.set(callerUid, {
+      chatId: currentChatId,
+      codeHash: hashOtpCode(callerUid, 'telegram_unlink', unlinkPin),
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      requestedAt: Date.now()
+    });
+
+    return res.json({
+      success: true,
+      requiresUnlinkPin: true,
+      maskedChatId: maskTelegramChatId(currentChatId),
+      expiresInSeconds: 300,
+      message: `6-digit change authorization PIN sent to ${maskTelegramChatId(currentChatId)} via @RecapsOtpBot.`
+    });
+  } catch (err) {
+    console.error('[Telegram] Error in /api/auth/telegram/request-unlink-otp:', err);
+    return res.status(500).json({ success: false, error: 'Failed to send Telegram change authorization PIN.', code: 'REQUEST_UNLINK_PIN_ERROR' });
+  }
+});
+
+/**
+ * POST /api/auth/telegram/unlink
+ * Verifies the 6-digit Authorization PIN sent to the currently linked Telegram account
+ * before unlinking it. Enforces persistent 3-strike -> 24-hour lockout on mismatch.
+ */
+app.post('/api/auth/telegram/unlink', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing token', code: 'UNAUTHORIZED' });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const callerUid = decoded.uid;
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
+    const { unlinkPin } = req.body || {};
+
+    const userDoc = await db.collection('users').doc(callerUid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User record not found', code: 'USER_NOT_FOUND' });
+    }
+
+    const userData = userDoc.data() || {};
+    const lockState = getPersistentLockoutState(userData);
+    if (lockState.locked) {
+      return res.status(429).json({
+        success: false,
+        error: lockState.message,
+        code: lockState.code,
+        lockedUntil: lockState.lockedUntil,
+        remainingMs: lockState.remainingMs
+      });
+    }
+
+    const { valid: chatFormatValid, clean: currentChatId } = validateTelegramChatIdFormat(userData.telegramChatId);
+    let allowLegacyBypass = false;
+
+    if (currentChatId && chatFormatValid && userData.telegramVerified !== true) {
+      const chatCheck = await verifyTelegramChat(TELEGRAM_OTP_BOT_TOKEN, currentChatId);
+      if (!chatCheck.ok) {
+        allowLegacyBypass = true;
+      }
+    } else if (!currentChatId || !chatFormatValid) {
+      allowLegacyBypass = true;
+    }
+
+    if (!allowLegacyBypass) {
+      const cleanPin = String(unlinkPin || '').trim();
+      if (!/^\d{6}$/.test(cleanPin)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Enter the exact 6-digit authorization PIN sent by @RecapsOtpBot to confirm changing your Telegram 2FA.',
+          code: 'UNLINK_PIN_REQUIRED'
+        });
+      }
+
+      const pendingUnlink = telegramUnlinkChallenges.get(callerUid);
+      if (!pendingUnlink) {
+        return res.status(400).json({
+          success: false,
+          error: 'No active change authorization PIN found. Click "Change" to request a fresh PIN from @RecapsOtpBot.',
+          code: 'NO_PENDING_UNLINK'
+        });
+      }
+
+      if (Date.now() > pendingUnlink.expiresAt) {
+        telegramUnlinkChallenges.delete(callerUid);
+        return res.status(400).json({
+          success: false,
+          error: 'Authorization PIN expired (5-minute limit). Request a new PIN to change your Telegram 2FA.',
+          code: 'UNLINK_PIN_EXPIRED'
+        });
+      }
+
+      const providedPinHash = hashOtpCode(callerUid, 'telegram_unlink', cleanPin);
+      if (!timingSafeEqualHex(pendingUnlink.codeHash, providedPinHash)) {
+        const strike = await recordPersistentVerificationFailure(callerUid, userData, 'Telegram 2FA change PIN mismatch', clientIp);
+        if (strike.locked) {
+          return res.status(429).json({
+            success: false,
+            error: `3 consecutive incorrect authorization PINs entered. Security lockout active for 24 hours (${formatLockoutDuration(strike.remainingMs)}).`,
+            code: 'ACCOUNT_LOCKED_24H',
+            lockedUntil: strike.lockedUntil,
+            remainingMs: strike.remainingMs
+          });
+        }
+        return res.status(403).json({
+          success: false,
+          error: `Incorrect authorization PIN. ${strike.remainingAttempts} attempt(s) remaining before 24-hour security lockout.`,
+          code: 'INVALID_UNLINK_PIN',
+          remainingAttempts: strike.remainingAttempts
+        });
+      }
+
+      // Single-use consumption + clear strikes
+      telegramUnlinkChallenges.delete(callerUid);
+      await clearPersistentVerificationFailures(callerUid);
+
+      // Notify previously linked Telegram that it was authorized and unlinked
+      const unlinkedNotice = `<b>RE-CAPS Security Notice: Telegram 2FA Unlinked</b>\n\n` +
+        `Your Telegram account was authorized and unlinked from RE-CAPS 2FA.\n` +
+        `<i>If you did not perform this action, secure your RE-CAPS account immediately.</i>`;
+      sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, currentChatId, unlinkedNotice).catch(() => {});
+    }
+
+    telegramLinkChallenges.delete(callerUid);
+    telegramUnlinkChallenges.delete(callerUid);
+    passwordChangeOtps.delete(callerUid);
+    verifiedStep1Sessions.delete(callerUid);
+
+    await db.collection('users').doc(callerUid).update({
+      telegramChatId: admin.firestore.FieldValue.delete(),
+      telegramVerified: admin.firestore.FieldValue.delete(),
+      telegramLinkedAt: admin.firestore.FieldValue.delete(),
+      telegramUsername: admin.firestore.FieldValue.delete()
+    });
+
+    return res.json({
+      success: true,
+      message: 'Telegram 2FA authorized and unlinked. You can now link and verify a new Chat ID.'
+    });
+  } catch (err) {
+    console.error('[Telegram] Error in /api/auth/telegram/unlink:', err);
+    return res.status(500).json({ success: false, error: 'Failed to unlink Telegram account.', code: 'UNLINK_CHAT_ERROR' });
+  }
+});
+
+/**
+ * POST /api/auth/verify-step1
+ * Hard Server-Side Step-1 Verification Gate BEFORE allowing Step 2 (New Password).
+ * - Admin/Librarian: Strictly verifies BOTH Current Password AND exact Telegram OTP code sent by @RecapsOtpBot.
+ * - Student/Teacher: Strictly verifies Current Password OR Security Answer server-side.
+ * - Enforces persistent Firestore 3-strike -> 24-hour lockout on failed attempts.
+ * - Issues a single-use CSPRNG verificationToken (5-min TTL) required by POST /api/auth/change-password.
+ */
+app.post('/api/auth/verify-step1', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Missing authentication token', code: 'UNAUTHORIZED' });
+    }
+
+    let callerUid;
+    let tokenEmail;
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      callerUid = decoded.uid;
+      tokenEmail = decoded.email;
+    } catch (tokenErr) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired session. Please log in again.', code: 'INVALID_TOKEN' });
+    }
+
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
+
+    const userDoc = await db.collection('users').doc(callerUid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User record not found in system', code: 'USER_NOT_FOUND' });
+    }
+
+    const userData = userDoc.data() || {};
+    const lockState = getPersistentLockoutState(userData);
+    if (lockState.locked) {
+      return res.status(429).json({
+        success: false,
+        error: lockState.message,
+        code: lockState.code,
+        lockedUntil: lockState.lockedUntil,
+        remainingMs: lockState.remainingMs
+      });
+    }
+
+    const userRole = (userData.role || userData.userType || 'student').toLowerCase();
+    const userEmail = userData.email || tokenEmail;
+    const { currentPassword, securityAnswer, otp } = req.body || {};
+
+    if (userRole === 'admin' || userRole === 'librarian') {
+      if (!currentPassword) {
+        return res.status(400).json({ success: false, error: 'Please enter your current password.', code: 'CURRENT_PASSWORD_REQUIRED' });
+      }
+
+      const cleanOtp = String(otp || '').trim();
+      if (!/^\d{6}$/.test(cleanOtp)) {
+        return res.status(400).json({ success: false, error: 'Please enter the exact 6-digit OTP code from @RecapsOtpBot.', code: 'OTP_REQUIRED' });
+      }
+
+      const storedOtpRecord = passwordChangeOtps.get(callerUid);
+      if (!storedOtpRecord) {
+        return res.status(400).json({
+          success: false,
+          error: 'No active OTP found. Click "Send OTP via Telegram" first to receive a fresh 6-digit code.',
+          code: 'NO_ACTIVE_OTP'
+        });
+      }
+
+      if (Date.now() > storedOtpRecord.expiresAt) {
+        passwordChangeOtps.delete(callerUid);
+        return res.status(400).json({
+          success: false,
+          error: 'Your Telegram OTP has expired (5-minute limit). Request a new OTP and try again.',
+          code: 'OTP_EXPIRED'
+        });
+      }
+
+      // 1. Strictly verify Telegram Bot OTP matches user input identically (constant-time)
+      const providedOtpHash = hashOtpCode(callerUid, 'password_change', cleanOtp);
+      if (!timingSafeEqualHex(storedOtpRecord.otpHash, providedOtpHash)) {
+        const strike = await recordPersistentVerificationFailure(callerUid, userData, 'Incorrect password-change Telegram OTP', clientIp);
+        if (strike.locked) {
+          return res.status(429).json({
+            success: false,
+            error: `3 consecutive incorrect verification attempts. Password change is locked for 24 hours (${formatLockoutDuration(strike.remainingMs)}).`,
+            code: 'ACCOUNT_LOCKED_24H',
+            lockedUntil: strike.lockedUntil,
+            remainingMs: strike.remainingMs
+          });
+        }
+        return res.status(403).json({
+          success: false,
+          error: `Incorrect Telegram OTP code. ${strike.remainingAttempts} attempt(s) remaining before 24-hour security lockout.`,
+          code: 'INVALID_OTP',
+          remainingAttempts: strike.remainingAttempts
+        });
+      }
+
+      // 2. Strictly verify Current Password against Firebase Auth
+      const isPasswordValid = await verifyUserCurrentPassword(userEmail, currentPassword);
+      if (!isPasswordValid) {
+        const strike = await recordPersistentVerificationFailure(callerUid, userData, 'Incorrect current password during 2FA verification', clientIp);
+        if (strike.locked) {
+          return res.status(429).json({
+            success: false,
+            error: `3 consecutive incorrect verification attempts. Password change is locked for 24 hours (${formatLockoutDuration(strike.remainingMs)}).`,
+            code: 'ACCOUNT_LOCKED_24H',
+            lockedUntil: strike.lockedUntil,
+            remainingMs: strike.remainingMs
+          });
+        }
+        return res.status(403).json({
+          success: false,
+          error: `Incorrect current password. ${strike.remainingAttempts} attempt(s) remaining before 24-hour security lockout.`,
+          code: 'INVALID_CURRENT_PASSWORD',
+          remainingAttempts: strike.remainingAttempts
+        });
+      }
+
+      // Both Current Password AND Telegram Bot OTP verified — consume single-use OTP
+      passwordChangeOtps.delete(callerUid);
+
+    } else {
+      let verifiedIdentity = false;
+      if (securityAnswer) {
+        const storedAnswer = (userData.securityAnswer || '').toString().trim().toLowerCase();
+        const providedAnswer = securityAnswer.toString().trim().toLowerCase();
+        if (storedAnswer && storedAnswer === providedAnswer) {
+          verifiedIdentity = true;
+        }
+      }
+      if (!verifiedIdentity && currentPassword) {
+        const isPasswordValid = await verifyUserCurrentPassword(userEmail, currentPassword);
+        if (isPasswordValid) {
+          verifiedIdentity = true;
+        }
+      }
+      if (!verifiedIdentity) {
+        const strike = await recordPersistentVerificationFailure(callerUid, userData, 'Incorrect Step-1 identity verification', clientIp);
+        if (strike.locked) {
+          return res.status(429).json({
+            success: false,
+            error: `3 consecutive incorrect verification attempts. Password change is locked for 24 hours (${formatLockoutDuration(strike.remainingMs)}).`,
+            code: 'ACCOUNT_LOCKED_24H',
+            lockedUntil: strike.lockedUntil,
+            remainingMs: strike.remainingMs
+          });
+        }
+        return res.status(403).json({
+          success: false,
+          error: `Verification failed. ${strike.remainingAttempts} attempt(s) remaining before 24-hour security lockout.`,
+          code: 'VERIFICATION_FAILED',
+          remainingAttempts: strike.remainingAttempts
+        });
+      }
+    }
+
+    // Success: reset strikes and issue single-use CSPRNG Step-1 verification token
+    await clearPersistentVerificationFailures(callerUid);
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    verifiedStep1Sessions.set(callerUid, {
+      tokenHash: hashOtpCode(callerUid, 'step1_verified', verificationToken),
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      role: userRole
+    });
+
+    return res.json({
+      success: true,
+      verificationToken,
+      expiresInSeconds: 300,
+      message: 'Identity and 2FA verified. You may now set your new password.'
+    });
+  } catch (err) {
+    console.error('[Security] Error in /api/auth/verify-step1:', err);
+    return res.status(500).json({ success: false, error: 'Failed to verify credentials due to a server error.', code: 'STEP1_VERIFY_ERROR' });
   }
 });
 
 /**
  * POST /api/auth/change-password
  * Complete 6-Layer Security Password Change Architecture:
- * - Layer 1: Step-Up Verification (Admin/Librarian: Current Password AND Telegram OTP; Student/Teacher: Password OR Security Question)
- * - Layer 2: Rate Limiting & Lockout (10 attempts/24h, 5 failures = 1 hour lockout)
+ * - Layer 1: Hard Server-Verified Step-1 Token (issued ONLY after Current Password + Exact Telegram Bot OTP match)
+ * - Layer 2: Persistent Firestore 3-Strike -> 24-Hour Security Lockout
  * - Layer 3: Strict Password Policy (Complexity, 128 max length, disallow personal info, block common passwords)
  * - Layer 4: Server-Side RBAC & Admin SDK Token Authentication
  * - Layer 5: Immediate Session Revocation across all devices via admin.auth().revokeRefreshTokens
@@ -2253,13 +3303,6 @@ app.post('/api/auth/change-password', async (req, res) => {
     }
 
     const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString().split(',')[0].trim();
-    const rateLimitKey = `${callerUid}_${clientIp}`;
-
-    // Layer 2: Rate Limiting & Lockout Check
-    const rateCheck = checkPasswordChangeRateLimit(rateLimitKey);
-    if (!rateCheck.allowed) {
-      return res.status(429).json({ success: false, error: rateCheck.message, code: rateCheck.code });
-    }
 
     // Fetch user document from Firestore
     const userDoc = await db.collection('users').doc(callerUid).get();
@@ -2268,97 +3311,61 @@ app.post('/api/auth/change-password', async (req, res) => {
     }
 
     const userData = userDoc.data() || {};
+
+    // Layer 2: Persistent Firestore 24-hour Lockout Check
+    const lockState = getPersistentLockoutState(userData);
+    if (lockState.locked) {
+      return res.status(429).json({
+        success: false,
+        error: lockState.message,
+        code: lockState.code,
+        lockedUntil: lockState.lockedUntil,
+        remainingMs: lockState.remainingMs
+      });
+    }
+
     const userRole = (userData.role || userData.userType || 'student').toLowerCase();
     const userEmail = userData.email || tokenEmail;
     const userChatId = userData.telegramChatId;
 
-    const { newPassword, currentPassword, securityAnswer, otp } = req.body || {};
+    const { newPassword, verificationToken } = req.body || {};
 
-    // Layer 1: Role-Based Step-Up Identity Re-verification
-    if (userRole === 'admin' || userRole === 'librarian') {
-      // ADMIN & LIBRARIAN: MUST be Current Password AND Telegram OTP
-      if (!currentPassword) {
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(400).json({ success: false, error: 'Staff accounts require your current password for security verification.', code: 'CURRENT_PASSWORD_REQUIRED' });
-      }
-
-      if (!otp) {
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(400).json({ success: false, error: 'Staff accounts require a 6-digit Telegram OTP verification code.', code: 'OTP_REQUIRED' });
-      }
-
-      // 1. Verify Current Password
-      const isPasswordValid = await verifyUserCurrentPassword(userEmail, currentPassword);
-      if (!isPasswordValid) {
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(403).json({ success: false, error: 'Incorrect current password. Verification failed.', code: 'INVALID_CURRENT_PASSWORD' });
-      }
-
-      // 2. Verify Telegram OTP
-      const storedOtpRecord = passwordChangeOtps.get(callerUid);
-      if (!storedOtpRecord) {
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(403).json({ success: false, error: 'No active OTP found. Please click "Send OTP to Telegram" first.', code: 'NO_ACTIVE_OTP' });
-      }
-
-      if (Date.now() > storedOtpRecord.expiresAt) {
-        passwordChangeOtps.delete(callerUid);
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(403).json({ success: false, error: 'OTP has expired (valid for 5 minutes). Please request a new OTP.', code: 'OTP_EXPIRED' });
-      }
-
-      storedOtpRecord.attempts++;
-      if (storedOtpRecord.attempts > 3) {
-        passwordChangeOtps.delete(callerUid);
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(403).json({ success: false, error: 'Too many incorrect OTP attempts. Please request a new OTP.', code: 'OTP_ATTEMPTS_EXCEEDED' });
-      }
-
-      if (storedOtpRecord.otp !== otp.toString().trim()) {
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(403).json({ success: false, error: 'Incorrect OTP code. Please check your Telegram message.', code: 'INVALID_OTP' });
-      }
-
-      // Consume OTP
-      passwordChangeOtps.delete(callerUid);
-
-    } else {
-      // STUDENT & TEACHER: Current Password OR Security Question
-      let verifiedIdentity = false;
-
-      // Option A: Security Answer
-      if (securityAnswer) {
-        const storedAnswer = (userData.securityAnswer || '').toString().trim().toLowerCase();
-        const providedAnswer = securityAnswer.toString().trim().toLowerCase();
-        if (storedAnswer && storedAnswer === providedAnswer) {
-          verifiedIdentity = true;
-        }
-      }
-
-      // Option B: Current Password
-      if (!verifiedIdentity && currentPassword) {
-        const isPasswordValid = await verifyUserCurrentPassword(userEmail, currentPassword);
-        if (isPasswordValid) {
-          verifiedIdentity = true;
-        }
-      }
-
-      if (!verifiedIdentity) {
-        recordPasswordChangeFailure(rateLimitKey);
-        return res.status(403).json({
-          success: false,
-          error: 'Verification failed. Please provide your correct Security Answer or Current Password.',
-          code: 'VERIFICATION_FAILED'
-        });
-      }
+    // Layer 1: Require valid single-use Step-1 verified session token (cannot bypass Step 1!)
+    const activeSession = verifiedStep1Sessions.get(callerUid);
+    if (!activeSession || !verificationToken) {
+      return res.status(403).json({
+        success: false,
+        error: 'Step-1 verification session is missing or expired. Please verify your current password and Telegram OTP again.',
+        code: 'STEP1_REQUIRED'
+      });
     }
 
-    // Layer 3: Strict New Password Policy Validation
+    if (Date.now() > activeSession.expiresAt) {
+      verifiedStep1Sessions.delete(callerUid);
+      return res.status(403).json({
+        success: false,
+        error: 'Your verification session expired (5-minute limit). Please verify Step 1 again.',
+        code: 'STEP1_EXPIRED'
+      });
+    }
+
+    const providedSessionHash = hashOtpCode(callerUid, 'step1_verified', String(verificationToken).trim());
+    if (!timingSafeEqualHex(activeSession.tokenHash, providedSessionHash)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Invalid verification session token. Please restart password verification.',
+        code: 'INVALID_STEP1_TOKEN'
+      });
+    }
+
+    // Layer 3: Strict New Password Policy Validation (keep token alive if user only needs to tweak password rules)
     const policyError = validateNewPasswordPolicy(newPassword, userData);
     if (policyError) {
-      recordPasswordChangeFailure(rateLimitKey);
       return res.status(400).json({ success: false, error: policyError, code: 'PASSWORD_POLICY_VIOLATION' });
     }
+
+    // Consume single-use Step-1 token immediately before credential mutation
+    verifiedStep1Sessions.delete(callerUid);
 
     // Layer 4: Admin SDK Password Update
     await admin.auth().updateUser(callerUid, {
@@ -2373,8 +3380,8 @@ app.post('/api/auth/change-password', async (req, res) => {
       console.warn('[Security] Token revocation warning:', revokeErr.message);
     }
 
-    // Record success in rate limiter
-    recordPasswordChangeSuccess(rateLimitKey);
+    // Clear any persistent lockout strikes after successful password rotation
+    await clearPersistentVerificationFailures(callerUid);
 
     // Formatted Timestamp (Asia/Manila, UTC+8)
     const formattedDate = new Intl.DateTimeFormat('en-PH', {
@@ -2386,17 +3393,21 @@ app.post('/api/auth/change-password', async (req, res) => {
     // Layer 6: Security Notifications Dispatch
     if (userRole === 'admin' || userRole === 'librarian') {
       // ADMIN & LIBRARIAN: Telegram AND Email Dual-Route Alert
-      const alertText = `🚨 <b>RE-CAPS Security Alert: Staff Password Changed</b>\n\n` +
-        `Hello <b>${userData.name || 'Staff Member'}</b>,\n` +
+      const staffDisplayName = escapeTelegramHtml(userData.name || userData.fullName || 'Staff Member');
+      const alertText = `<b>RE-CAPS Security Alert: Staff Password Changed</b>\n\n` +
+        `Hello <b>${staffDisplayName}</b>,\n` +
         `Your RE-CAPS account password was successfully updated.\n\n` +
-        `📅 <b>Timestamp:</b> ${formattedDate}\n` +
-        `🌐 <b>IP Address:</b> <code>${clientIp}</code>\n` +
-        `👤 <b>Role:</b> ${userRole.toUpperCase()}\n\n` +
-        `⚠️ <i>All previous active sessions have been securely terminated. If you did not make this change, contact system security immediately!</i>`;
+        `<b>Timestamp:</b> ${escapeTelegramHtml(formattedDate)}\n` +
+        `<b>IP Address:</b> <code>${escapeTelegramHtml(clientIp)}</code>\n` +
+        `<b>Role:</b> ${escapeTelegramHtml(userRole.toUpperCase())}\n\n` +
+        `<i>All previous active sessions have been securely terminated. If you did not make this change, contact system security immediately.</i>`;
 
-      // 1. Telegram Dispatch
+      // 1. Telegram Dispatch (Alert bot with OTP bot fallback)
       if (userChatId) {
-        await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, userChatId, alertText);
+        const alertSent = await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, userChatId, alertText);
+        if (!alertSent) {
+          await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, userChatId, alertText);
+        }
       }
 
       // 2. Email Dispatch via Resend
@@ -2406,22 +3417,22 @@ app.post('/api/auth/change-password', async (req, res) => {
           const fromField = RESEND_FROM_NAME ? `${RESEND_FROM_NAME} <${RESEND_FROM_EMAIL}>` : RESEND_FROM_EMAIL;
           const emailHtml = `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
-              <div style="background: #111827; padding: 24px; text-align: center;">
-                <h2 style="color: #ffffff; margin: 0; font-size: 20px;">🛡️ RE-CAPS Security Notice</h2>
+              <div style="background: #2a2f35; padding: 24px; text-align: center;">
+                <h2 style="color: #F7F7F8; margin: 0; font-size: 20px;">RE-CAPS Security Notice</h2>
               </div>
               <div style="padding: 32px 24px;">
-                <h3 style="color: #1f2937; margin-top: 0;">Password Changed Successfully</h3>
-                <p style="color: #4b5563; line-height: 1.6;">Hello <strong>${userData.name || 'Staff Member'}</strong>,</p>
-                <p style="color: #4b5563; line-height: 1.6;">The password for your <strong>${userRole.toUpperCase()}</strong> account (<code>${userEmail}</code>) was just changed.</p>
+                <h3 style="color: #2a2f35; margin-top: 0;">Password Changed Successfully</h3>
+                <p style="color: #334155; line-height: 1.6;">Hello <strong>${staffDisplayName}</strong>,</p>
+                <p style="color: #334155; line-height: 1.6;">The password for your <strong>${escapeTelegramHtml(userRole.toUpperCase())}</strong> account (<code>${escapeTelegramHtml(userEmail)}</code>) was just changed.</p>
                 <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin: 20px 0;">
-                  <p style="margin: 4px 0; color: #374151;"><strong>📅 Date & Time:</strong> ${formattedDate}</p>
-                  <p style="margin: 4px 0; color: #374151;"><strong>🌐 Source IP:</strong> ${clientIp}</p>
-                  <p style="margin: 4px 0; color: #374151;"><strong>🔒 Session Security:</strong> All other active sessions have been revoked.</p>
+                  <p style="margin: 4px 0; color: #334155;"><strong>Date &amp; Time:</strong> ${escapeTelegramHtml(formattedDate)}</p>
+                  <p style="margin: 4px 0; color: #334155;"><strong>Source IP:</strong> ${escapeTelegramHtml(clientIp)}</p>
+                  <p style="margin: 4px 0; color: #334155;"><strong>Session Security:</strong> All other active sessions have been revoked.</p>
                 </div>
-                <p style="color: #dc2626; font-weight: 600; font-size: 14px;">If you did not perform this change, please contact the Head Librarian immediately.</p>
+                <p style="color: #ef4444; font-weight: 600; font-size: 14px;">If you did not perform this change, please contact the Head Librarian immediately.</p>
               </div>
-              <div style="background: #f3f4f6; padding: 16px; text-align: center; color: #6b7280; font-size: 12px;">
-                Cebu Technological University - Daanbantayan Campus Library • RE-CAPS System
+              <div style="background: #f3f4f6; padding: 16px; text-align: center; color: #64748b; font-size: 12px;">
+                Cebu Technological University - Daanbantayan Campus Library &bull; RE-CAPS System
               </div>
             </div>
           `;
@@ -2435,11 +3446,11 @@ app.post('/api/auth/change-password', async (req, res) => {
             body: JSON.stringify({
               from: fromField,
               to: [userEmail],
-              subject: '⚠️ Security Alert: RE-CAPS Staff Password Changed',
+              subject: 'Security Alert: RE-CAPS Staff Password Changed',
               html: emailHtml
             })
           });
-          console.log(`✉️ [Security] Dispatched dual-route alert email to ${userEmail}`);
+          console.log(`[Security] Dispatched dual-route alert email to ${userEmail}`);
         } catch (mailErr) {
           console.error('[Security] Failed to dispatch alert email:', mailErr.message);
         }
@@ -2447,15 +3458,19 @@ app.post('/api/auth/change-password', async (req, res) => {
 
     } else {
       // STUDENT & TEACHER: Telegram ONLY (with fallback to email if Telegram not linked yet)
-      const alertText = `🔔 <b>RE-CAPS Security Notice: Password Updated</b>\n\n` +
-        `Hello <b>${userData.name || 'Student/Researcher'}</b>,\n` +
+      const userDisplayName = escapeTelegramHtml(userData.name || userData.fullName || 'Student/Researcher');
+      const alertText = `<b>RE-CAPS Security Notice: Password Updated</b>\n\n` +
+        `Hello <b>${userDisplayName}</b>,\n` +
         `Your RE-CAPS account password was successfully updated.\n\n` +
-        `📅 <b>Timestamp:</b> ${formattedDate}\n` +
-        `🌐 <b>IP Address:</b> <code>${clientIp}</code>\n\n` +
-        `🔒 <i>All other active sessions have been securely closed. If you did not make this change, please report it to the CTU Library.</i>`;
+        `<b>Timestamp:</b> ${escapeTelegramHtml(formattedDate)}\n` +
+        `<b>IP Address:</b> <code>${escapeTelegramHtml(clientIp)}</code>\n\n` +
+        `<i>All other active sessions have been securely closed. If you did not make this change, please report it to the CTU Library.</i>`;
 
       if (userChatId) {
-        await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, userChatId, alertText);
+        const alertSent = await sendTelegramMessage(TELEGRAM_ALERT_BOT_TOKEN, userChatId, alertText);
+        if (!alertSent) {
+          await sendTelegramMessage(TELEGRAM_OTP_BOT_TOKEN, userChatId, alertText);
+        }
       } else {
         // Fallback: If Telegram is not yet linked, send email notification so they are alerted
         const activeResendKey = (process.env.RESEND_API_KEY || RESEND_API_KEY || '').trim();
@@ -2465,12 +3480,12 @@ app.post('/api/auth/change-password', async (req, res) => {
             const emailHtml = `
               <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
                 <div style="background: #08D488; padding: 20px; text-align: center;">
-                  <h2 style="color: #ffffff; margin: 0; font-size: 20px;">RE-CAPS Security Alert</h2>
+                  <h2 style="color: #2a2f35; margin: 0; font-size: 20px;">RE-CAPS Security Alert</h2>
                 </div>
                 <div style="padding: 24px;">
-                  <p style="color: #374151;">Hello <strong>${userData.name || 'User'}</strong>,</p>
-                  <p style="color: #374151;">Your password was updated on <strong>${formattedDate}</strong> from IP <code>${clientIp}</code>.</p>
-                  <p style="color: #6b7280; font-size: 13px;">💡 Tip: Connect with @RecapsOtpBot on Telegram to receive instant mobile security alerts directly on Telegram.</p>
+                  <p style="color: #334155;">Hello <strong>${userDisplayName}</strong>,</p>
+                  <p style="color: #334155;">Your password was updated on <strong>${escapeTelegramHtml(formattedDate)}</strong> from IP <code>${escapeTelegramHtml(clientIp)}</code>.</p>
+                  <p style="color: #64748b; font-size: 13px;">Note: Connect with @RecapsOtpBot on Telegram to receive instant mobile security alerts directly on Telegram.</p>
                 </div>
               </div>
             `;
@@ -2629,10 +3644,10 @@ app.post('/api/users/create-librarian', async (req, res) => {
       }
     });
   } catch (err) {
-    console.error('❌ Error in /api/users/create-librarian:', err);
+    console.error('[Users] Error in /api/users/create-librarian:', err);
     return res.status(500).json({
       success: false,
-      message: err.message || 'Internal server error while creating librarian'
+      message: 'Internal server error while creating librarian account.'
     });
   }
 });
@@ -2792,7 +3807,7 @@ async function backfillRegisteredIdsRegistry() {
  * POST /api/auth/check-id-unique
  * Authoritative pre-registration uniqueness check (zero PII exposed).
  */
-app.post('/api/auth/check-id-unique', async (req, res) => {
+app.post('/api/auth/check-id-unique', idCheckRateLimiter, async (req, res) => {
   try {
     if (!checkIdEndpointRateLimit(req)) {
       return res.status(429).json({
@@ -3018,22 +4033,11 @@ app.post('/api/auth/register-profile', async (req, res) => {
 // HEALTH CHECK
 // ============================================
 app.get('/api/health', (req, res) => {
-  const providersStatus = {};
-  
-  for (const [key, provider] of Object.entries(AI_PROVIDERS)) {
-    providersStatus[key] = {
-      name: provider.name,
-      configured: !!provider.apiKey,
-      model: provider.model
-    };
-  }
-  
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     firebase: 'connected',
-    pinecone: 'connected',
-    aiProviders: providersStatus
+    pinecone: 'connected'
   });
 });
 
@@ -3087,7 +4091,7 @@ process.on('uncaughtException', (error) => {
  * POST /api/feedback
  * Send feedback email via Resend API
  */
-app.post('/api/feedback', async (req, res) => {
+app.post('/api/feedback', feedbackRateLimiter, async (req, res) => {
   try {
     const { name, email, feeling, subject, message, images } = req.body;
     
