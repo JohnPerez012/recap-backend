@@ -2291,7 +2291,8 @@ async function pollTelegramUpdates() {
     // Non-blocking network glitch
   }
 }
-setInterval(pollTelegramUpdates, 12000);
+const telegramPollTimer = setInterval(pollTelegramUpdates, 12000);
+telegramPollTimer.unref();
 
 // In-Memory 2FA OTP, Enrollment Challenge, Unlink PIN & Step-1 Verified Session Storage
 // Persistent 3-strike -> 24-hour lockout is stored authoritatively in Firestore (users/{uid}.securityLockout)
@@ -4045,48 +4046,6 @@ app.get('/api/health', (req, res) => {
 // FEEDBACK ENDPOINT
 // ============================================
 
-// ============================================
-// START SERVER
-// ============================================
-app.listen(PORT, () => {
-  console.log(`\n${'='.repeat(50)}`);
-  console.log(`🚀 RECAP Backend Server`);
-  console.log(`${'='.repeat(50)}`);
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Firebase: Connected`);
-  console.log(`Pinecone: Connected (${indexName})`);
-  console.log(`\n📡 AI Providers (Priority Order):`);
-  console.log(`    1. ${AI_PROVIDERS.mistral.name} ${AI_PROVIDERS.mistral.apiKey ? '' : '✗'}`);
-  console.log(`    2. ${AI_PROVIDERS.groq.name} ${AI_PROVIDERS.groq.apiKey ? '' : '✗'}`);
-  console.log(`    3. ${AI_PROVIDERS.gemini.name} ${AI_PROVIDERS.gemini.apiKey ? '' : '✗'}`);
-  console.log(`    4. ${AI_PROVIDERS.openrouter.name} ${AI_PROVIDERS.openrouter.apiKey ? '' : '✗'}`);
-  console.log(`\n🌐 Endpoints:`);
-  console.log(`    POST   /api/pinecone/search - RAG semantic search`);
-  console.log(`    POST   /api/chat - AI chat with fallback`);
-  console.log(`    POST   /api/feedback - Send feedback email`);
-  console.log(`    DELETE /api/users/:uid - Delete user from Auth & Firestore`);
-  console.log(`    POST   /api/users/delete - Delete user fallback`);
-  console.log(`    GET    /api/health - Health check`);
-  console.log(`${'='.repeat(50)}\n`);
-  backfillRegisteredIdsRegistry().catch(() => {});
-});
-
-// ============================================
-// ERROR HANDLING
-// ============================================
-process.on('unhandledRejection', (error) => {
-  console.error('❌ Unhandled rejection:', error);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught exception:', error);
-  process.exit(1);
-});
-
-// ============================================
-// FEEDBACK ENDPOINT
-// ============================================
-
 /**
  * POST /api/feedback
  * Send feedback email via Resend API
@@ -4562,7 +4521,111 @@ app.post('/api/feedback', feedbackRateLimiter, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to send feedback. Please try again later.',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      details: !IS_PRODUCTION ? error.message : undefined
     });
   }
+});
+
+// ============================================
+// GLOBAL 404 & ERROR HANDLING MIDDLEWARE (STRICT JSON, ZERO HTML/STACK LEAKS)
+// ============================================
+app.use((_req, res) => {
+  res.status(404).json({
+    success: false,
+    code: 'NOT_FOUND',
+    error: 'Endpoint not found.'
+  });
+});
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  // Malformed JSON request payload (body-parser SyntaxError)
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({
+      success: false,
+      code: 'INVALID_JSON',
+      error: 'Malformed JSON request payload.'
+    });
+  }
+
+  // Request body exceeds configured Express JSON size cap
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({
+      success: false,
+      code: 'PAYLOAD_TOO_LARGE',
+      error: 'Request payload exceeds the maximum allowed size.'
+    });
+  }
+
+  console.error(`[Server Error] ${req.method} ${req.originalUrl}:`, err && err.message ? err.message : err);
+  const statusCode = (err && Number.isInteger(err.status) && err.status >= 400 && err.status < 600)
+    ? err.status
+    : 500;
+
+  return res.status(statusCode).json({
+    success: false,
+    code: statusCode === 500 ? 'INTERNAL_SERVER_ERROR' : 'REQUEST_ERROR',
+    error: IS_PRODUCTION
+      ? (statusCode === 500 ? 'An unexpected server error occurred. Please try again later.' : 'Request could not be processed.')
+      : (err && err.message ? err.message : 'Internal server error')
+  });
+});
+
+// ============================================
+// START SERVER & GRACEFUL SHUTDOWN
+// ============================================
+const httpServer = app.listen(PORT, () => {
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`🚀 RECAP Backend Server`);
+  console.log(`${'='.repeat(50)}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Firebase: Connected`);
+  console.log(`Pinecone: Connected (${indexName})`);
+  console.log(`\n📡 AI Providers (Priority Order):`);
+  console.log(`    1. ${AI_PROVIDERS.mistral.name} ${AI_PROVIDERS.mistral.apiKey ? '' : '✗'}`);
+  console.log(`    2. ${AI_PROVIDERS.groq.name} ${AI_PROVIDERS.groq.apiKey ? '' : '✗'}`);
+  console.log(`    3. ${AI_PROVIDERS.gemini.name} ${AI_PROVIDERS.gemini.apiKey ? '' : '✗'}`);
+  console.log(`    4. ${AI_PROVIDERS.openrouter.name} ${AI_PROVIDERS.openrouter.apiKey ? '' : '✗'}`);
+  console.log(`\n🌐 Endpoints:`);
+  console.log(`    POST   /api/pinecone/search - RAG semantic search`);
+  console.log(`    POST   /api/chat - AI chat with fallback`);
+  console.log(`    POST   /api/feedback - Send feedback email`);
+  console.log(`    DELETE /api/users/:uid - Delete user from Auth & Firestore`);
+  console.log(`    POST   /api/users/delete - Delete user fallback`);
+  console.log(`    GET    /api/health - Health check`);
+  console.log(`${'='.repeat(50)}\n`);
+  backfillRegisteredIdsRegistry().catch(() => {});
+});
+
+let isShuttingDown = false;
+function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[Shutdown] Received ${signal}. Closing HTTP server and background timers...`);
+  if (telegramPollTimer) {
+    clearInterval(telegramPollTimer);
+  }
+  httpServer.close(() => {
+    console.log('[Shutdown] All HTTP connections closed cleanly.');
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.warn('[Shutdown] Force exiting after 10s grace timeout.');
+    process.exit(0);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('unhandledRejection', (error) => {
+  console.error('❌ Unhandled rejection:', error);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught exception:', error);
+  process.exit(1);
 });
