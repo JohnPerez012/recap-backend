@@ -48,6 +48,8 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production' || Boolean(process.e
 const DEFAULT_ALLOWED_ORIGINS = [
   'https://re-caps.web.app',
   'https://re-caps.firebaseapp.com',
+  'https://recaps.cebutech.digital',
+  'https://www.recaps.cebutech.digital',
   'https://recap-backend-jy5b.onrender.com'
 ];
 const EXTRA_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '')
