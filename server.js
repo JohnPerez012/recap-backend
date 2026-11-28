@@ -2531,7 +2531,11 @@ async function handleUserDeletion(uid, email, res) {
       const existingData = doc.exists ? (doc.data() || {}) : {};
       await releaseUserIdsFromRegistry(targetUid, existingData);
 
-      if (doc.exists) {
+      if (typeof db.recursiveDelete === 'function') {
+        await db.recursiveDelete(userDocRef);
+        firestoreDeleted = true;
+        console.log(`Recursively deleted Firestore document and subcollections for user ${targetUid}`);
+      } else if (doc.exists) {
         await userDocRef.delete();
         firestoreDeleted = true;
         console.log(`Deleted Firestore document for user ${targetUid}`);
@@ -2922,7 +2926,7 @@ function parseUserAgentSummary(uaRaw = '') {
   return { os, browser, deviceType, deviceName: `${os} · ${browser}` };
 }
 
-async function verifyAuthenticatedDeviceCaller(req, res) {
+async function verifyAuthenticatedDeviceCaller(req, res, { requireExistingProfile = false } = {}) {
   const authHeader = req.headers.authorization || '';
   const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
   if (!idToken) {
@@ -2931,6 +2935,13 @@ async function verifyAuthenticatedDeviceCaller(req, res) {
   }
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
+    if (requireExistingProfile) {
+      const userSnap = await db.collection('users').doc(decoded.uid).get();
+      if (!userSnap.exists) {
+        res.status(404).json({ success: false, error: 'User profile does not exist.', code: 'PROFILE_NOT_FOUND' });
+        return null;
+      }
+    }
     return decoded;
   } catch (err) {
     res.status(401).json({ success: false, error: 'Invalid or expired session', code: 'INVALID_TOKEN' });
@@ -2945,7 +2956,7 @@ async function verifyAuthenticatedDeviceCaller(req, res) {
  */
 app.post('/api/auth/devices/register', async (req, res) => {
   try {
-    const decoded = await verifyAuthenticatedDeviceCaller(req, res);
+    const decoded = await verifyAuthenticatedDeviceCaller(req, res, { requireExistingProfile: true });
     if (!decoded) return;
 
     const body = req.body || {};
@@ -3045,6 +3056,18 @@ app.get('/api/auth/devices', async (req, res) => {
     const decoded = await verifyAuthenticatedDeviceCaller(req, res);
     if (!decoded) return;
 
+    const userSnap = await db.collection('users').doc(decoded.uid).get();
+    if (!userSnap.exists) {
+      return res.json({
+        success: true,
+        profileMissing: true,
+        activeCount: 0,
+        totalCount: 0,
+        currentRevoked: false,
+        devices: []
+      });
+    }
+
     const currentDeviceId = typeof req.query.deviceId === 'string' ? req.query.deviceId.trim() : '';
     const devicesSnap = await db.collection('users').doc(decoded.uid).collection('devices').get();
 
@@ -3097,7 +3120,7 @@ app.get('/api/auth/devices', async (req, res) => {
  */
 app.post('/api/auth/devices/revoke', async (req, res) => {
   try {
-    const decoded = await verifyAuthenticatedDeviceCaller(req, res);
+    const decoded = await verifyAuthenticatedDeviceCaller(req, res, { requireExistingProfile: true });
     if (!decoded) return;
 
     const body = req.body || {};
@@ -3138,7 +3161,7 @@ app.post('/api/auth/devices/revoke', async (req, res) => {
  */
 app.post('/api/auth/devices/revoke-others', async (req, res) => {
   try {
-    const decoded = await verifyAuthenticatedDeviceCaller(req, res);
+    const decoded = await verifyAuthenticatedDeviceCaller(req, res, { requireExistingProfile: true });
     if (!decoded) return;
 
     const body = req.body || {};
